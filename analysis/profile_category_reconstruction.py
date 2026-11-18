@@ -52,15 +52,15 @@ def _value(result: Any, name: str, default: Any = None) -> Any:
     return getattr(result, name, default)
 
 
-def _confidence_bucket(value: Any) -> str:
-    """Return a stable aggregate confidence bucket."""
+def _score_margin_bucket(value: Any) -> str:
+    """Return a stable bucket for a non-calibrated classified score margin."""
     try:
-        confidence = float(value)
+        score_margin = float(value)
     except (TypeError, ValueError):
         return "not_reported"
-    if confidence >= 0.80:
+    if score_margin >= 0.80:
         return "high"
-    if confidence >= 0.60:
+    if score_margin >= 0.60:
         return "medium"
     return "low"
 
@@ -144,7 +144,7 @@ def profile_category_reconstruction(database_url: str) -> dict[str, Any]:
                 total = 0
                 category_counts: Counter[str] = Counter()
                 status_counts: Counter[str] = Counter()
-                confidence_counts: Counter[str] = Counter()
+                score_margin_counts: Counter[str] = Counter()
                 evidence_counts: Counter[str] = Counter()
                 category_status_counts: dict[str, Counter[str]] = defaultdict(Counter)
                 for row in rows:
@@ -163,7 +163,10 @@ def profile_category_reconstruction(database_url: str) -> dict[str, Any]:
                     category_counts[aggregate_category] += 1
                     status_counts[status] += 1
                     category_status_counts[aggregate_category][status] += 1
-                    confidence_counts[_confidence_bucket(_value(result, "confidence"))] += 1
+                    if status == "classified":
+                        score_margin_counts[
+                            _score_margin_bucket(_value(result, "score_margin_ratio"))
+                        ] += 1
                     sources = _safe_sources(result)
                     if not sources:
                         evidence_counts["none"] += 1
@@ -200,7 +203,7 @@ def profile_category_reconstruction(database_url: str) -> dict[str, Any]:
             },
             "category_counts": dict(sorted(category_counts.items())),
             "status_counts": dict(sorted(status_counts.items())),
-            "confidence_buckets": dict(sorted(confidence_counts.items())),
+            "classified_score_margin_buckets": dict(sorted(score_margin_counts.items())),
             "evidence_source_counts": dict(sorted(evidence_counts.items())),
             "category_status_counts": {
                 category: dict(sorted(counts.items()))

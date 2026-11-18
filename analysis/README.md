@@ -38,4 +38,4 @@ After updating the deterministic research-category rules, measure their aggregat
   --output-markdown data_platform/runtime/analysis/category-reconstruction-profile.md
 ```
 
-This command reads raw category evidence, tags, titles, and descriptions inside a repeatable-read, read-only transaction, but emits only aggregate category, status, confidence, and evidence-source counts. It never writes event identifiers or source text. `review` and `unmapped` results remain excluded from category-level modelling until independently reviewed.
+This command reads raw category evidence, tags, titles, and descriptions inside a repeatable-read, read-only transaction, but emits only aggregate category, status, classified score-margin, and evidence-source counts. The score margin is a rule diagnostic, not a calibrated probability, and is reported only for classified events. The profiler never writes event identifiers or source text. `review` and `unmapped` results remain excluded from category-level modelling until independently reviewed.

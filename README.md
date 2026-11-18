@@ -19,6 +19,8 @@ Work is coordinated through role-specific agents and reviewed through evidence g
 - [Agent operating rules](AGENTS.md)
 - [Contribution and pull-request workflow](CONTRIBUTING.md)
 - [Project plan and acceptance gates](docs/PROJECT_PLAN.md)
+- [Historical data datasheet](docs/data/datasheet.md)
+- [Analytical dataset contract](docs/data/analytical-dataset-contract.md)
 - [Executable analysis guide](analysis/README.md)
 - [Local demonstration guide](demo/README.md)
 

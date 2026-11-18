@@ -13,3 +13,16 @@ This directory will contain deterministic entry points that generate the project
 - Analytical conclusions describe association, not causation.
 
 The top-level reproduction command will be `scripts/reproduce_analysis.sh`. Until the data gate is satisfied, that command must fail clearly or run only fixture-backed structural checks; it must never fabricate research results.
+
+## Historical Coverage Profile
+
+Generate aggregate-only source evidence from an existing PostgreSQL analytics database:
+
+```bash
+.venv/bin/python analysis/profile_historical_data.py \
+  --database-url "$DATABASE_URL" \
+  --output-json data_platform/runtime/analysis/historical-profile.json \
+  --output-markdown data_platform/runtime/analysis/historical-profile.md
+```
+
+The profiler starts a repeatable-read, read-only transaction, verifies the required analytics tables, and reports only aggregate counts, date ranges, category coverage, resolution coverage, and prediction-validation coverage. It also records resolver methods and confidence statistics and warns that heuristic price-threshold or fallback resolution labels are not authoritative outcome ground truth. It never emits database URLs, wallet identifiers, or raw transactions. Runtime outputs remain ignored and must not be treated as model-performance evidence.

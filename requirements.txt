@@ -1,0 +1,24 @@
+# Backend/API
+fastapi>=0.133,<1
+uvicorn[standard]>=0.41,<1
+python-multipart>=0.0.22,<1
+email-validator>=2.3,<3
+pydantic>=2.12,<3
+
+# Database
+alembic>=1.14,<2
+SQLAlchemy>=2.0,<3
+psycopg[binary]>=3.2,<4
+
+# Security/auth
+argon2-cffi>=23.1,<24
+cryptography>=44,<45
+
+# Polymarket ingest
+httpx>=0.28,<1
+python-dateutil>=2.9,<3
+python-dotenv>=1.2,<2
+
+# ML
+scikit-learn>=1.6,<2
+lightgbm>=4.6,<5

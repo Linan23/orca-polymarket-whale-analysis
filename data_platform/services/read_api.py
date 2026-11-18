@@ -1,0 +1,4247 @@
+"""Read-only query helpers for the internal FastAPI endpoints."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from sqlalchemy import desc, func, select, text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from data_platform.models import (
+    Dashboard,
+    DashboardMarket,
+    MarketContract,
+    MarketProfile,
+    MlMarketPredictionSnapshot,
+    MlMarketPredictionValidation,
+    OrderbookSnapshot,
+    Platform,
+    PositionSnapshot,
+    ScrapeRun,
+    TransactionFact,
+    UserAccount,
+    UserLeaderboard,
+    UserProfile,
+    WhaleScoreSnapshot,
+)
+from data_platform.services.home_summary_snapshot import latest_home_summary_snapshot_payload, market_category_coverage_payload
+from data_platform.ml.prediction_confidence import DEFAULT_CONFIDENCE_MODEL_PATH, load_confidence_artifact
+from data_platform.services.ml_reports import market_profile_ml_trend
+from data_platform.services.polymarket_live import LivePolymarketMarket
+from data_platform.services.polymarket_live import fetch_live_polymarket_market_by_slug
+from data_platform.services.research_analytics_snapshot import latest_research_analytics_view
+from data_platform.services.whale_event_sequences import whale_event_sequence_for_market
+from data_platform.services.whale_scoring import load_resolved_market_outcomes, load_resolved_user_performance
+from data_platform.settings import get_settings
+
+
+DEFAULT_LIMIT = 50
+POTENTIAL_WHALE_MIN_TRUST_SCORE = 1.08
+POTENTIAL_WHALE_MIN_SAMPLE_TRADES = 5
+HIGH_CONFIDENCE_DIRECTION_WINDOW_HOURS = 12
+HIGH_CONFIDENCE_DIRECTION_MIN_DELTA_PTS = 5.0
+HIGH_CONFIDENCE_24H_MIN_DELTA_PTS = 6.0
+HIGH_CONFIDENCE_24H_MIN_TOTAL_PRESSURE = 1000.0
+_CONFIDENCE_ARTIFACT_CACHE: tuple[float | None, dict[str, Any] | None] = (None, None)
+MARKET_CATEGORY_SQL = """
+CASE
+  WHEN LOWER(CONCAT_WS(' ', me.title, me.slug, me.category, mc.question, mc.market_slug, mc.outcome_a_label, mc.outcome_b_label)) ~ '(video[ -]?games?|videogames?|gaming|gta|grand theft auto|nintendo|playstation|xbox|steam|esports?|counter[ -]?strike|cs2|fortnite|call of duty|rockstar|rocket league|league of legends|valorant|dota)'
+    THEN 'Video Game'
+  WHEN LOWER(CONCAT_WS(' ', me.title, me.slug, me.category, mc.question, mc.market_slug, mc.outcome_a_label, mc.outcome_b_label)) ~ '(crypto|cryptocurrenc|bitcoin|ethereum|solana|doge|dogecoin|xrp|btc|eth|token|airdrop|coinbase|kraken|stablecoin|microstrategy|mstr|blockchain|defi)'
+    THEN 'Crypto'
+  WHEN LOWER(CONCAT_WS(' ', me.title, me.slug, me.category, mc.question, mc.market_slug, mc.outcome_a_label, mc.outcome_b_label)) ~ '(finance|financial|stocks?|stock market|equities|shares|earnings|revenue|eps|guidance|market cap|fed|federal reserve|interest rates?|rate cuts?|rate hikes?|inflation|\\bcpi\\b|\\bppi\\b|recession|\\bgdp\\b|unemployment|jobs report|payrolls|commodit|\\boil\\b|\\bgold\\b|\\bsilver\\b|\\betfs?\\b|banks?|jpmorgan|goldman|ipo|merger|acquisition|buyout|s&p[ -]?500|sp500|nasdaq|dow jones|treasur|bonds?|yields?|mortgage rates?)'
+    THEN 'Finance'
+  WHEN LOWER(CONCAT_WS(' ', me.title, me.slug, me.category, mc.question, mc.market_slug, mc.outcome_a_label, mc.outcome_b_label)) ~ '(technology|tech|openai|gpt|llm|artificial intelligence|\\bai\\b|nvidia|amd|microsoft|google|alphabet|meta|apple|anthropic|sam altman|semiconductor|chips?|software|hardware)'
+    THEN 'Technology'
+  WHEN LOWER(CONCAT_WS(' ', me.title, me.slug, me.category, mc.question, mc.market_slug, mc.outcome_a_label, mc.outcome_b_label)) ~ '(geopolit|world affairs|foreign policy|diplom|ceasefire|military|nato|ukraine|russia|putin|zelensky|china|taiwan|iran|israel|gaza|syria|middle east|\\bwar\\b)'
+    THEN 'Geopolitics'
+  WHEN LOWER(CONCAT_WS(' ', me.title, me.slug, me.category, mc.question, mc.market_slug, mc.outcome_a_label, mc.outcome_b_label)) ~ '(politic|elections?|government|president|presidential|prime minister|congress|senate|parliament|cabinet|minister|tariff|trump|biden|starmer|macron|supreme court|us government)'
+    THEN 'Politics'
+  ELSE 'Other'
+END
+"""
+
+
+def _potential_whale_clause() -> Any:
+    """Return the SQLAlchemy predicate for potential-whale classification."""
+    return (
+        WhaleScoreSnapshot.is_whale.is_(False),
+        WhaleScoreSnapshot.is_trusted_whale.is_(False),
+        UserAccount.is_likely_insider.is_(False),
+        WhaleScoreSnapshot.trust_score >= POTENTIAL_WHALE_MIN_TRUST_SCORE,
+        WhaleScoreSnapshot.sample_trade_count >= POTENTIAL_WHALE_MIN_SAMPLE_TRADES,
+    )
+VALID_TIMEFRAMES = {"7d": 7, "30d": 30, "90d": 90, "all": None}
+USER_ACTIVITY_RECENT_TRADE_LIMIT = 15
+settings = get_settings()
+
+
+def _score_whale_status(is_whale: Any, is_trusted_whale: Any) -> bool:
+    """Return the retention whale marker derived from score flags."""
+    return bool(is_whale) or bool(is_trusted_whale)
+
+
+def _with_current_whale_status(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Add the current boolean whale_status field to older cached user-row payloads."""
+    if payload is None:
+        return None
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return payload
+    for item in items:
+        if isinstance(item, dict) and ("is_whale" in item or "is_trusted_whale" in item):
+            item["whale_status"] = _score_whale_status(item.get("is_whale"), item.get("is_trusted_whale"))
+    return payload
+
+
+def _latest_successful_scrape_time(session: Session) -> datetime | None:
+    """Return the latest successful scrape completion time."""
+    row = session.scalars(
+        select(ScrapeRun)
+        .where(ScrapeRun.status == "success")
+        .order_by(desc(ScrapeRun.finished_at), desc(ScrapeRun.started_at), desc(ScrapeRun.scrape_run_id))
+        .limit(1)
+    ).first()
+    if row is None:
+        return None
+    return row.finished_at or row.started_at
+
+
+def _freshness_metadata(
+    *,
+    observed_at: datetime | None,
+    threshold_minutes: int,
+    freshness_source: str,
+    last_successful_ingest_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Return additive freshness metadata for API payloads."""
+    if observed_at is None:
+        return {
+            "is_stale": True,
+            "stale_as_of": None,
+            "freshness_source": freshness_source,
+            "last_successful_ingest_at": last_successful_ingest_at.isoformat() if last_successful_ingest_at else None,
+        }
+    stale_as_of = observed_at + timedelta(minutes=threshold_minutes)
+    return {
+        "is_stale": datetime.now(timezone.utc) > stale_as_of,
+        "stale_as_of": stale_as_of.isoformat(),
+        "freshness_source": freshness_source,
+        "last_successful_ingest_at": last_successful_ingest_at.isoformat() if last_successful_ingest_at else None,
+    }
+
+
+def timeframe_start(timeframe: str) -> datetime | None:
+    """Return the UTC lower-bound datetime for a supported timeframe label."""
+    if timeframe not in VALID_TIMEFRAMES:
+        raise ValueError(f"Unsupported timeframe '{timeframe}'. Use one of: {', '.join(sorted(VALID_TIMEFRAMES))}.")
+    days = VALID_TIMEFRAMES[timeframe]
+    if days is None:
+        return None
+    return datetime.now(timezone.utc) - timedelta(days=days)
+
+
+def _latest_whale_batch(session: Session) -> tuple[Any, Any] | None:
+    """Return the latest coherent whale-score batch identifiers."""
+    latest_snapshot_time = session.scalar(select(func.max(WhaleScoreSnapshot.snapshot_time)))
+    if latest_snapshot_time is None:
+        return None
+    return session.execute(
+        select(
+            WhaleScoreSnapshot.snapshot_time,
+            WhaleScoreSnapshot.scoring_version,
+        )
+        .where(WhaleScoreSnapshot.snapshot_time == latest_snapshot_time)
+        .order_by(
+            desc(WhaleScoreSnapshot.whale_score_snapshot_id),
+        )
+        .limit(1)
+    ).first()
+
+
+def _resolved_summary(session: Session, user_id: int) -> dict[str, Any]:
+    """Return resolved-market performance details for one user."""
+    resolved_performance_by_user, _ = load_resolved_user_performance(session)
+    return _resolved_summary_payload(resolved_performance_by_user.get(user_id))
+
+
+def _resolved_summary_payload(resolved: Any | None) -> dict[str, Any]:
+    """Serialize one resolved-performance record into the API payload shape."""
+    if resolved is None:
+        return {
+            "resolved_market_count": 0,
+            "winning_market_count": 0,
+            "realized_pnl": 0.0,
+            "realized_roi": 0.0,
+            "excluded_market_count": 0,
+            "win_rate": None,
+        }
+    return {
+        "resolved_market_count": int(resolved.resolved_market_count),
+        "winning_market_count": int(resolved.winning_market_count),
+        "realized_pnl": float(resolved.realized_pnl),
+        "realized_roi": float(resolved.realized_roi),
+        "excluded_market_count": int(resolved.excluded_market_count),
+        "win_rate": (
+            round(resolved.winning_market_count / resolved.resolved_market_count, 6)
+            if resolved.resolved_market_count > 0
+            else None
+        ),
+    }
+
+
+def _market_status_label(is_closed: bool | None) -> str:
+    """Collapse market status into the UI's open/closed vocabulary."""
+    return "Closed" if bool(is_closed) else "Open"
+
+
+def _parse_payload_datetime(value: Any) -> datetime | None:
+    """Parse ISO datetimes that were already serialized into an API payload."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    text_value = str(value).strip()
+    if not text_value:
+        return None
+    if text_value.endswith("Z"):
+        text_value = f"{text_value[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text_value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _coerce_float(value: Any) -> float | None:
+    """Return a finite float from API payload values."""
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed == parsed and parsed not in (float("inf"), float("-inf")) else None
+
+
+def _clamp_pct(value: float) -> float:
+    """Clamp a percentage-point value to 0-100."""
+    return max(0.0, min(value, 100.0))
+
+
+def _direction_from_delta(delta: float) -> str:
+    """Return the dashboard movement direction for a percentage-point delta."""
+    if delta > 0.25:
+        return "up"
+    if delta < -0.25:
+        return "down"
+    return "flat"
+
+
+def _append_unique(values: list[str], value: str) -> list[str]:
+    """Append a warning/reason once while preserving order."""
+    if value not in values:
+        values.append(value)
+    return values
+
+
+def _confidence_artifact() -> dict[str, Any] | None:
+    """Return the current trained confidence artifact, reloading when the file changes."""
+    global _CONFIDENCE_ARTIFACT_CACHE
+    try:
+        mtime = DEFAULT_CONFIDENCE_MODEL_PATH.stat().st_mtime
+    except OSError:
+        _CONFIDENCE_ARTIFACT_CACHE = (None, None)
+        return None
+    cached_mtime, cached_artifact = _CONFIDENCE_ARTIFACT_CACHE
+    if cached_mtime == mtime:
+        return cached_artifact
+    artifact = load_confidence_artifact(DEFAULT_CONFIDENCE_MODEL_PATH)
+    _CONFIDENCE_ARTIFACT_CACHE = (mtime, artifact)
+    return artifact
+
+
+def _historical_accuracy_from_confidence_artifact(item: dict[str, Any]) -> float | None:
+    """Return historical Strong/Watch precision for a trained prediction row."""
+    artifact = _confidence_artifact()
+    if not artifact:
+        return None
+    try:
+        window_hours = int(item.get("prediction_window_hours") or str(item.get("window") or "").replace("h", ""))
+    except (TypeError, ValueError):
+        return None
+    window_model = (artifact.get("windows") or {}).get(str(window_hours))
+    if not isinstance(window_model, dict):
+        return None
+    thresholds = window_model.get("thresholds") if isinstance(window_model.get("thresholds"), dict) else {}
+    tier = str(item.get("historical_validation_tier") or item.get("direction_signal_tier") or "")
+    threshold_name = ""
+    if tier in {"trained_strong_confidence", "strong"}:
+        threshold_name = "strong"
+    elif tier in {"trained_watch_confidence", "watch"}:
+        threshold_name = "watch"
+    if not threshold_name:
+        return None
+    threshold_detail = thresholds.get(threshold_name) if isinstance(thresholds.get(threshold_name), dict) else {}
+    precision = _coerce_float(threshold_detail.get("precision"))
+    return round(precision * 100.0, 2) if precision is not None else None
+
+
+def _apply_market_profile_reliability_policy(item: dict[str, Any]) -> None:
+    """Annotate profile predictions with the currently validated reliable slice."""
+    if item.get("trained_confidence_available") is True:
+        score = _coerce_float(item.get("trained_confidence_score"))
+        if score is not None:
+            item["direction_signal_confidence"] = round(score, 4)
+        accuracy_pct = _coerce_float(item.get("validation_accuracy_pct") or item.get("direction_signal_accuracy_pct"))
+        if accuracy_pct is None:
+            accuracy_pct = _historical_accuracy_from_confidence_artifact(item)
+        if accuracy_pct is not None:
+            item["validation_accuracy_pct"] = round(accuracy_pct, 2)
+            item["direction_signal_accuracy_pct"] = round(accuracy_pct, 2)
+            item.setdefault("accuracy_source", "current_confidence_artifact_threshold_precision")
+            item["historical_validation_direction_match_pct"] = round(accuracy_pct, 2)
+        if item.get("confidence_training_window_rows") is not None:
+            item["historical_validation_sample_size"] = item.get("confidence_training_window_rows")
+        warnings = list(item.get("reliability_warnings") or [])
+        tier = str(item.get("historical_validation_tier") or "")
+        if tier == "trained_low_confidence":
+            _append_unique(warnings, "trained_low_confidence")
+            item["display_tier"] = "review"
+            item["review_reasons"] = ["trained_low_confidence"]
+        elif tier in {"trained_watch_confidence", "trained_strong_confidence"}:
+            item["display_tier"] = "show"
+            item["review_reasons"] = []
+        item["reliability_warnings"] = warnings
+        return
+    try:
+        window_hours = int(item.get("prediction_window_hours") or str(item.get("window") or "").replace("h", ""))
+    except (TypeError, ValueError):
+        window_hours = 0
+    predicted_delta = _coerce_float(item.get("predicted_delta_pts"))
+    signal_tier = str(item.get("direction_signal_tier") or "")
+    predicted_direction = str(item.get("predicted_direction") or "")
+    whale_anchor = item.get("whale_anchor") if isinstance(item.get("whale_anchor"), dict) else {}
+    total_pressure = _coerce_float(whale_anchor.get("side_total_pressure")) or 0.0
+    is_high_confidence_12h = (
+        window_hours == HIGH_CONFIDENCE_DIRECTION_WINDOW_HOURS
+        and signal_tier == "watch"
+        and predicted_direction != "flat"
+        and predicted_delta is not None
+        and abs(predicted_delta) >= HIGH_CONFIDENCE_DIRECTION_MIN_DELTA_PTS
+    )
+    is_high_confidence_24h = (
+        window_hours == 24
+        and signal_tier == "watch"
+        and predicted_direction != "flat"
+        and predicted_delta is not None
+        and abs(predicted_delta) >= HIGH_CONFIDENCE_24H_MIN_DELTA_PTS
+        and total_pressure >= HIGH_CONFIDENCE_24H_MIN_TOTAL_PRESSURE
+    )
+    is_high_confidence = is_high_confidence_12h or is_high_confidence_24h
+    warnings = list(item.get("reliability_warnings") or [])
+    if signal_tier == "strong" and predicted_direction != "flat":
+        item["display_tier"] = "show"
+        item["historical_validation_tier"] = "strong_model_signal"
+        item["historical_validation_reason"] = "strict model signal; monitor completed validations before treating it as broad-market accuracy"
+        item["historical_validation_direction_match_pct"] = None
+        item["historical_validation_sample_size"] = None
+    elif is_high_confidence:
+        item["display_tier"] = "show"
+        item["historical_validation_tier"] = "high_confidence_historical_slice"
+        item["historical_validation_reason"] = (
+            "24h Watch with at least 6pt predicted movement and whale pressure above 1000 reached 81.48% direction match in the older validation sample"
+            if is_high_confidence_24h
+            else "12h Watch with at least 5pt predicted movement reached 81.82% direction match in the older validation sample"
+        )
+        item["historical_validation_direction_match_pct"] = 81.48 if is_high_confidence_24h else 81.82
+        item["historical_validation_sample_size"] = 27 if is_high_confidence_24h else 22
+        item["direction_signal_tier_reason"] = (
+            "historical validation supports this 24h Watch signal when predicted movement is at least 6 points with strong whale pressure"
+            if is_high_confidence_24h
+            else "historical validation supports this 12h Watch signal when predicted movement is at least 5 points"
+        )
+        item["review_reasons"] = []
+    elif signal_tier == "watch":
+        item["display_tier"] = "review"
+        item["historical_validation_tier"] = "review_only"
+        item["historical_validation_reason"] = (
+            "watch signal is visible, but this slice has not validated above the 70% target yet"
+        )
+        item["historical_validation_direction_match_pct"] = None
+        item["historical_validation_sample_size"] = None
+        item["review_reasons"] = ["review_only"]
+        _append_unique(warnings, "review_only")
+    else:
+        item["display_tier"] = "review"
+        item["historical_validation_tier"] = "insufficient_validated_accuracy"
+        item["historical_validation_reason"] = (
+            "abstain and weak-signal slices validated poorly and should not be treated as reliable direction forecasts"
+        )
+        item["historical_validation_direction_match_pct"] = None
+        item["historical_validation_sample_size"] = None
+        _append_unique(warnings, "insufficient_validated_accuracy")
+    item["reliability_warnings"] = warnings
+
+
+def _profile_side_label(contract: MarketContract) -> str | None:
+    """Infer the side label represented by a dashboard contract row."""
+    question = str(contract.question or "")
+    if question.endswith("]") and "[" in question:
+        candidate = question.rsplit("[", 1)[-1].rstrip("]").strip()
+        if candidate:
+            return candidate
+    return contract.outcome_a_label or contract.outcome_b_label
+
+
+def _live_market_payload(live_market: LivePolymarketMarket) -> dict[str, Any]:
+    """Serialize the live Polymarket fields used by the dashboard."""
+    return {
+        "source": "polymarket_gamma_live",
+        "market_url": live_market.market_url,
+        "event_slug": live_market.event_slug,
+        "question": live_market.question,
+        "outcomes": list(live_market.outcomes),
+        "outcome_probabilities": live_market.outcome_probabilities(),
+        "last_trade_price": live_market.last_trade_price,
+        "best_bid": live_market.best_bid,
+        "best_ask": live_market.best_ask,
+        "spread": live_market.spread,
+        "volume": live_market.volume,
+        "liquidity": live_market.liquidity,
+        "is_active": live_market.active,
+        "is_closed": live_market.closed,
+        "is_archived": live_market.archived,
+        "updated_at": live_market.updated_at.isoformat() if live_market.updated_at else None,
+        "closed_time": live_market.closed_time.isoformat() if live_market.closed_time else None,
+    }
+
+
+def _live_market_result_label(live_market: LivePolymarketMarket) -> str:
+    """Return a compact resolved-result label from a closed live Gamma market."""
+    if not live_market.closed:
+        return "Closed"
+    return live_market.primary_side_label() or "Closed"
+
+
+def _apply_live_polymarket_following_card_overlay(card: dict[str, Any]) -> dict[str, Any]:
+    """Mark a followed-market card closed when live Gamma has newer status than the DB."""
+    if card.get("market_status_label") == "Closed":
+        return card
+
+    live_market = fetch_live_polymarket_market_by_slug(str(card.get("market_slug") or ""))
+    if live_market is None or not live_market.closed:
+        return card
+
+    if live_market.question:
+        card["question"] = live_market.question
+    if live_market.last_trade_price is not None:
+        card["price"] = live_market.last_trade_price
+    card["market_url"] = live_market.market_url
+    card["market_status_label"] = "Closed"
+    card["database_is_closed"] = False
+    card["closed_status_source"] = "polymarket_gamma_live"
+    card["closed_time"] = (
+        live_market.closed_time.isoformat()
+        if live_market.closed_time
+        else live_market.observed_at.isoformat()
+        if live_market.observed_at
+        else None
+    )
+    card["result_label"] = _live_market_result_label(live_market)
+    return card
+
+
+def _closed_time_from_live_market(live_market: LivePolymarketMarket) -> str | None:
+    """Return the best serialized close timestamp from a live Gamma market."""
+    if live_market.closed_time:
+        return live_market.closed_time.isoformat()
+    if live_market.observed_at:
+        return live_market.observed_at.isoformat()
+    return None
+
+
+def _apply_live_polymarket_market_status_overlay(row: dict[str, Any]) -> dict[str, Any]:
+    """Correct an open market row when live Gamma says the market is closed."""
+    if row.get("market_status_label") == "Closed":
+        return row
+
+    live_market = fetch_live_polymarket_market_by_slug(str(row.get("market_slug") or ""))
+    if live_market is None or live_market.closed is not True:
+        return row
+
+    updated = dict(row)
+    if live_market.question:
+        updated["question"] = live_market.question
+    if live_market.last_trade_price is not None:
+        updated["price"] = live_market.last_trade_price
+    if live_market.volume is not None:
+        updated["volume"] = live_market.volume
+    updated["market_url"] = live_market.market_url
+    updated["market_status_label"] = "Closed"
+    updated["database_is_closed"] = False
+    updated["closed_status_source"] = "polymarket_gamma_live"
+    updated["closed_time"] = _closed_time_from_live_market(live_market)
+    return updated
+
+
+def _apply_live_polymarket_market_rows_overlay(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Apply live closed-status corrections to payloads containing market rows."""
+    if payload is None:
+        return None
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return payload
+
+    updated_payload = dict(payload)
+    updated_items: list[Any] = []
+    for item in items:
+        if isinstance(item, dict):
+            updated_items.append(_apply_live_polymarket_market_status_overlay(item))
+        else:
+            updated_items.append(item)
+    updated_payload["items"] = updated_items
+    updated_payload["count"] = len(updated_items)
+    return updated_payload
+
+
+def _apply_live_polymarket_following_focus_overlay(
+    item: dict[str, Any],
+    *,
+    live_market_cache: dict[str, LivePolymarketMarket | None],
+    slug_key: str = "market_slug",
+) -> dict[str, Any]:
+    """Correct followed-trader focus rows when live Gamma has newer market status."""
+    if item.get("market_status_label") == "Closed":
+        return item
+
+    market_slug = str(item.get(slug_key) or "").strip()
+    if not market_slug:
+        return item
+
+    normalized_slug = market_slug.casefold()
+    if normalized_slug not in live_market_cache:
+        live_market_cache[normalized_slug] = fetch_live_polymarket_market_by_slug(market_slug)
+    live_market = live_market_cache[normalized_slug]
+    if live_market is None or live_market.closed is not True:
+        return item
+
+    updated = dict(item)
+    if live_market.question:
+        question_key = "main_market_question" if slug_key == "main_market_slug" else "question"
+        updated[question_key] = live_market.question
+    updated["market_status_label"] = "Closed"
+    updated["database_is_closed"] = False
+    updated["closed_status_source"] = "polymarket_gamma_live"
+    updated["closed_time"] = _closed_time_from_live_market(live_market)
+    return updated
+
+
+def _apply_live_polymarket_profile_overlay(
+    payload: dict[str, Any],
+    *,
+    contract: MarketContract,
+) -> tuple[dict[str, Any], LivePolymarketMarket | None]:
+    """Overlay live Gamma side probabilities on a market-profile payload."""
+    live_market = fetch_live_polymarket_market_by_slug(str(payload.get("market_slug") or contract.market_slug or ""))
+    if live_market is None:
+        return payload, None
+
+    side_label = _profile_side_label(contract)
+    live_price = live_market.price_for_side(side_label)
+    observed_at = live_market.observed_at
+    live_payload = _live_market_payload(live_market)
+
+    payload["market_url"] = live_market.market_url
+    if live_market.question:
+        payload["question"] = live_market.question
+    if live_price is not None:
+        payload["price"] = live_price
+        payload["odds"] = live_price
+    if live_market.volume is not None:
+        payload["volume"] = live_market.volume
+    payload["market_status_label"] = _market_status_label(live_market.closed)
+    payload["realtime_source"] = "polymarket_gamma_live"
+    if observed_at is not None:
+        payload["read_time"] = observed_at.isoformat()
+        payload["snapshot_time"] = observed_at.isoformat()
+    payload["selected_side_label"] = side_label
+    payload["primary_side_label"] = live_market.primary_side_label()
+    payload["outcome_probabilities"] = live_market.outcome_probabilities()
+    payload["realtime_payload"] = {
+        **(payload.get("realtime_payload") if isinstance(payload.get("realtime_payload"), dict) else {}),
+        **live_payload,
+        "selected_side_label": side_label,
+        "selected_side_probability": live_price,
+    }
+    return payload, live_market
+
+
+def _apply_profile_freshness(
+    payload: dict[str, Any],
+    *,
+    fallback_observed_at: datetime | None,
+    fallback_source: str,
+    last_successful_ingest_at: datetime | None,
+    live_market: LivePolymarketMarket | None,
+) -> dict[str, Any]:
+    """Attach freshness metadata, treating live closed markets as resolved snapshots."""
+    if live_market is not None and live_market.closed:
+        return {
+            "is_stale": False,
+            "stale_as_of": None,
+            "freshness_source": "polymarket_gamma_live.closed_market",
+            "last_successful_ingest_at": last_successful_ingest_at.isoformat() if last_successful_ingest_at else None,
+        }
+    observed_at = live_market.observed_at if live_market is not None else None
+    freshness_source = "polymarket_gamma_live.updated_at" if live_market is not None else fallback_source
+    return _freshness_metadata(
+        observed_at=observed_at or _parse_payload_datetime(payload.get("snapshot_time")) or fallback_observed_at,
+        threshold_minutes=settings.market_stale_minutes,
+        freshness_source=freshness_source,
+        last_successful_ingest_at=last_successful_ingest_at,
+    )
+
+
+def _whale_bias_label(yes_value: float | int | None, no_value: float | int | None) -> str:
+    """Return a simple YES/NO lean label from comparable aggregate values."""
+    yes_total = float(yes_value or 0)
+    no_total = float(no_value or 0)
+    if yes_total <= 0 and no_total <= 0:
+        return "Mixed"
+    if yes_total > no_total:
+        return "Mostly Yes"
+    if no_total > yes_total:
+        return "Mostly No"
+    return "Balanced"
+
+
+def _looks_generated_display_label(value: str | None) -> bool:
+    """Return True when a display label matches the generated adjective-noun pattern."""
+    if not value or "-" not in value:
+        return False
+    parts = value.split("-")
+    return len(parts) == 2 and all(part[:1].isupper() and part[1:].islower() for part in parts if part)
+
+
+def _best_user_identity_label(
+    *,
+    token: str,
+    preferred_username: str | None,
+    display_label: str | None,
+    external_user_ref: str | None,
+) -> str:
+    """Choose the best user-facing identity label for market focus displays."""
+    preferred = (preferred_username or "").strip()
+    if preferred and preferred != token:
+        return preferred
+
+    display = (display_label or "").strip()
+    if display and display != token and not _looks_generated_display_label(display):
+        return display
+
+    external = (external_user_ref or "").strip()
+    if external and external != token and not external.startswith("0x"):
+        return external
+
+    return token
+
+
+def _normalize_whale_market_focus(session: Session, value: str | None) -> str | None:
+    """Replace stale wallet-like whale focus labels with current user identities when possible."""
+    if not value:
+        return value
+    tokens = [item.strip() for item in value.split(",") if item.strip()]
+    if not tokens:
+        return None
+
+    normalized_tokens = {token.lower() for token in tokens}
+    rows = session.scalars(
+        select(UserAccount).where(
+            func.lower(func.coalesce(UserAccount.external_user_ref, "")).in_(normalized_tokens)
+            | func.lower(func.coalesce(UserAccount.wallet_address, "")).in_(normalized_tokens)
+        )
+    ).all()
+
+    replacement_by_token: dict[str, str] = {}
+    for row in rows:
+        candidate_tokens = {item for item in [row.external_user_ref, row.wallet_address] if item}
+        for candidate in candidate_tokens:
+            lowered = candidate.lower()
+            if lowered not in normalized_tokens:
+                continue
+            replacement_by_token[lowered] = _best_user_identity_label(
+                token=candidate,
+                preferred_username=row.preferred_username,
+                display_label=row.display_label,
+                external_user_ref=row.external_user_ref,
+            )
+
+    return ", ".join(replacement_by_token.get(token.lower(), token) for token in tokens)
+
+
+def _serialize_market_profile(
+    *,
+    dashboard_id: int,
+    market_id: int,
+    market: DashboardMarket | None,
+    contract: MarketContract,
+    profile: MarketProfile | None,
+    observed_volume: float | None = None,
+    orderbook_depth: int | None = None,
+) -> dict[str, Any]:
+    """Serialize a market profile response from dashboard-backed or fallback market data."""
+    market_slug = market.market_slug if market and market.market_slug else contract.market_slug
+    price = float(market.price) if market and market.price is not None else (
+        float(contract.last_trade_price) if contract.last_trade_price is not None else None
+    )
+    volume = float(market.volume) if market and market.volume is not None else (
+        float(contract.volume) if contract.volume is not None else observed_volume
+    )
+    odds = float(market.odds) if market and market.odds is not None else price
+    resolved_orderbook_depth = (
+        int(market.orderbook_depth or 0)
+        if market and market.orderbook_depth is not None
+        else orderbook_depth
+    )
+    read_time = market.read_time if market and market.read_time is not None else contract.updated_at
+    snapshot_time = profile.snapshot_time if profile and profile.snapshot_time is not None else contract.updated_at
+
+    payload = {
+        "dashboard_id": dashboard_id,
+        "market_id": market_id,
+        "market_contract_id": contract.market_contract_id,
+        "market_slug": market_slug,
+        "market_url": market.market_url if market and market.market_url else contract.market_url,
+        "question": contract.question,
+        "price": price,
+        "volume": volume,
+        "odds": odds,
+        "orderbook_depth": resolved_orderbook_depth,
+        "whale_count": int(market.whale_count or 0) if market else 0,
+        "trusted_whale_count": int(market.trusted_whale_count or 0) if market else 0,
+        "whale_market_focus": market.whale_market_focus if market else None,
+        "read_time": read_time.isoformat() if read_time else None,
+        "market_status_label": _market_status_label(contract.is_closed),
+        "realtime_source": profile.realtime_source if profile else "normalized_source_fallback",
+        "snapshot_time": snapshot_time.isoformat() if snapshot_time else None,
+        "realtime_payload": (
+            profile.realtime_payload
+            if profile
+            else {
+                "question": contract.question,
+                "last_trade_price": float(contract.last_trade_price) if contract.last_trade_price is not None else None,
+                "volume": float(contract.volume) if contract.volume is not None else None,
+                "is_active": contract.is_active,
+                "is_closed": contract.is_closed,
+                "updated_at": contract.updated_at.isoformat() if contract.updated_at else None,
+            }
+        ),
+    }
+    payload, _ = _apply_live_polymarket_profile_overlay(payload, contract=contract)
+    return payload
+
+def _observed_trade_volume_for_market(session: Session, *, contract: MarketContract, market_slug: str | None) -> float | None:
+    """Return observed market volume from ingested trades when source market volume is unavailable."""
+    if market_slug:
+        market_ids = select(MarketContract.market_contract_id).where(MarketContract.market_slug == market_slug)
+        volume = session.scalar(
+            select(func.sum(TransactionFact.notional_value)).where(TransactionFact.market_contract_id.in_(market_ids))
+        )
+    else:
+        volume = session.scalar(
+            select(func.sum(TransactionFact.notional_value)).where(
+                TransactionFact.market_contract_id == contract.market_contract_id
+            )
+        )
+    return float(volume) if volume is not None else None
+
+
+def _latest_orderbook_depth_for_market(session: Session, *, contract: MarketContract, market_slug: str | None) -> int | None:
+    """Return the newest orderbook depth for this market or any same-slug outcome row."""
+    if market_slug:
+        market_ids = select(MarketContract.market_contract_id).where(MarketContract.market_slug == market_slug)
+        depth = session.scalar(
+            select(OrderbookSnapshot.depth_levels)
+            .where(OrderbookSnapshot.market_contract_id.in_(market_ids))
+            .order_by(desc(OrderbookSnapshot.snapshot_time), desc(OrderbookSnapshot.orderbook_snapshot_id))
+            .limit(1)
+        )
+    else:
+        depth = session.scalar(
+            select(OrderbookSnapshot.depth_levels)
+            .where(OrderbookSnapshot.market_contract_id == contract.market_contract_id)
+            .order_by(desc(OrderbookSnapshot.snapshot_time), desc(OrderbookSnapshot.orderbook_snapshot_id))
+            .limit(1)
+        )
+    return int(depth) if depth is not None else None
+
+
+def _top_market_whales_by_trust_score(session: Session, *, market_slug: str, limit: int = 5) -> dict[str, Any]:
+    """Return the top whales active in one market, ranked by latest trust score."""
+    latest_batch = _latest_whale_batch(session)
+    if latest_batch is None:
+        return {
+            "market_slug": market_slug,
+            "snapshot_time": None,
+            "scoring_version": None,
+            "count": 0,
+            "items": [],
+        }
+
+    rows = session.execute(
+        text(
+            """
+            WITH latest_scores AS (
+              SELECT
+                w.user_id,
+                w.trust_score,
+                w.profitability_score,
+                w.sample_trade_count,
+                w.is_whale,
+                w.is_trusted_whale,
+                w.snapshot_time,
+                w.scoring_version
+              FROM analytics.whale_score_snapshot w
+              JOIN analytics.platform p
+                ON p.platform_id = w.platform_id
+              WHERE w.snapshot_time = :snapshot_time
+                AND w.scoring_version = :scoring_version
+                AND p.platform_name = 'polymarket'
+                AND (w.is_whale = TRUE OR w.is_trusted_whale = TRUE)
+            ),
+            market_contracts AS (
+              SELECT market_contract_id
+              FROM analytics.market_contract
+              WHERE market_slug = :market_slug
+            ),
+            market_trades AS (
+              SELECT tf.*
+              FROM analytics.transaction_fact tf
+              JOIN market_contracts mc
+                ON mc.market_contract_id = tf.market_contract_id
+            ),
+            whale_market_stats AS (
+              SELECT
+                mt.user_id,
+                COUNT(mt.transaction_id) AS trade_count,
+                COUNT(mt.transaction_id) FILTER (WHERE LOWER(COALESCE(mt.side, '')) = 'buy') AS buy_trade_count,
+                COUNT(mt.transaction_id) FILTER (WHERE LOWER(COALESCE(mt.side, '')) = 'sell') AS sell_trade_count,
+                COALESCE(SUM(mt.notional_value), 0) AS total_notional,
+                COALESCE(SUM(mt.shares), 0) AS total_shares,
+                COALESCE(SUM(mt.notional_value) / NULLIF(SUM(mt.shares), 0), 0) AS avg_trade_price,
+                MAX(mt.transaction_time) AS latest_trade_time
+              FROM market_trades mt
+              GROUP BY mt.user_id
+            ),
+            latest_market_trade AS (
+              SELECT DISTINCT ON (mt.user_id)
+                mt.user_id,
+                mt.side AS latest_side,
+                mt.outcome_label AS latest_outcome_label,
+                mt.price AS latest_trade_price,
+                mt.transaction_time AS latest_trade_time
+              FROM market_trades mt
+              ORDER BY mt.user_id, mt.transaction_time DESC, mt.transaction_id DESC
+            )
+            SELECT
+              ua.user_id,
+              ua.external_user_ref,
+              ua.wallet_address,
+              ua.preferred_username,
+              ua.display_label,
+              ls.trust_score,
+              ls.profitability_score,
+              ls.sample_trade_count,
+              ls.is_whale,
+              ls.is_trusted_whale,
+              wms.trade_count,
+              wms.buy_trade_count,
+              wms.sell_trade_count,
+              wms.total_notional,
+              wms.total_shares,
+              wms.avg_trade_price,
+              wms.latest_trade_time,
+              lmt.latest_side,
+              lmt.latest_outcome_label,
+              lmt.latest_trade_price
+            FROM whale_market_stats wms
+            JOIN latest_scores ls
+              ON ls.user_id = wms.user_id
+            JOIN analytics.user_account ua
+              ON ua.user_id = wms.user_id
+            LEFT JOIN latest_market_trade lmt
+              ON lmt.user_id = wms.user_id
+            ORDER BY
+              ls.trust_score DESC,
+              wms.total_notional DESC,
+              wms.trade_count DESC,
+              ua.user_id ASC
+            LIMIT :limit
+            """
+        ),
+        {
+            "market_slug": market_slug,
+            "snapshot_time": latest_batch.snapshot_time,
+            "scoring_version": latest_batch.scoring_version,
+            "limit": limit,
+        },
+    ).mappings().all()
+    items = [
+        {
+            "user_id": int(row["user_id"]),
+            "external_user_ref": row["external_user_ref"],
+            "wallet_address": row["wallet_address"],
+            "preferred_username": row["preferred_username"],
+            "display_label": row["display_label"],
+            "trust_score": float(row["trust_score"] or 0),
+            "profitability_score": float(row["profitability_score"] or 0),
+            "sample_trade_count": int(row["sample_trade_count"] or 0),
+            "is_whale": bool(row["is_whale"]),
+            "is_trusted_whale": bool(row["is_trusted_whale"]),
+            "trade_count": int(row["trade_count"] or 0),
+            "buy_trade_count": int(row["buy_trade_count"] or 0),
+            "sell_trade_count": int(row["sell_trade_count"] or 0),
+            "total_notional": float(row["total_notional"] or 0),
+            "total_shares": float(row["total_shares"] or 0),
+            "avg_trade_price": float(row["avg_trade_price"] or 0),
+            "latest_trade_time": row["latest_trade_time"].isoformat() if row["latest_trade_time"] else None,
+            "latest_side": row["latest_side"],
+            "latest_outcome_label": row["latest_outcome_label"],
+            "latest_trade_price": float(row["latest_trade_price"]) if row["latest_trade_price"] is not None else None,
+        }
+        for row in rows
+    ]
+    return {
+        "market_slug": market_slug,
+        "snapshot_time": latest_batch.snapshot_time.isoformat() if latest_batch.snapshot_time else None,
+        "scoring_version": latest_batch.scoring_version,
+        "count": len(items),
+        "items": items,
+    }
+
+
+def market_profile_top_whales(session: Session, *, market_slug: str, limit: int = 5) -> dict[str, Any]:
+    """Return top market whales for the market-profile top-whales tab."""
+    return _top_market_whales_by_trust_score(session, market_slug=market_slug, limit=limit)
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    """Return a timezone-aware datetime from an ISO string when possible."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _add_hours_iso(value: str | None, hours: int) -> str | None:
+    """Return an ISO timestamp offset from an anchor timestamp."""
+    parsed = _parse_iso_datetime(value)
+    if parsed is None:
+        return None
+    return (parsed + timedelta(hours=hours)).isoformat()
+
+
+def _prediction_window_hours(window_name: str) -> int:
+    """Return integer hours from a prediction window label."""
+    try:
+        return int(str(window_name).strip().lower().replace("h", ""))
+    except ValueError:
+        return 0
+
+
+def _normalize_side_label(value: str | None) -> str:
+    """Return a normalized side label for joining live whale sequences to ML rows."""
+    return str(value or "").strip().casefold()
+
+
+def _compact_sequence_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Return the market-profile-safe subset of a semi-live whale sequence."""
+    windows = item.get("window_features") or {}
+    return {
+        "market_slug": item.get("market_slug"),
+        "side_label": item.get("side_label"),
+        "market_status": item.get("market_status"),
+        "current_market_price_pct": item.get("current_market_price_pct"),
+        "signal": item.get("signal") or {},
+        "entry_anchor": item.get("entry_anchor"),
+        "exit_anchor": item.get("exit_anchor"),
+        "window_features": {
+            key: windows.get(key)
+            for key in ("1h", "6h", "12h", "24h")
+            if key in windows
+        },
+    }
+
+
+def _primary_whale_entry_anchor(sequence: dict[str, Any]) -> dict[str, Any]:
+    """Return the most recent live whale entry anchor across market sides."""
+    items = sequence.get("items") or []
+    anchors = [
+        {
+            **(item.get("entry_anchor") or {}),
+            "side_label": item.get("side_label"),
+            "market_slug": item.get("market_slug"),
+        }
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get("entry_anchor"), dict)
+    ]
+    if not anchors:
+        return {
+            "available": False,
+            "reason": sequence.get("reason") or "no_recent_whale_entry_anchor",
+        }
+    selected = max(anchors, key=lambda item: str(item.get("event_time") or ""))
+    return {
+        "available": True,
+        "event_type": selected.get("event_type") or "entry",
+        "event_time": selected.get("event_time"),
+        "age_hours": selected.get("age_hours"),
+        "odds_pct": selected.get("odds_pct"),
+        "notional_value": selected.get("notional_value"),
+        "weighted_notional": selected.get("weighted_notional"),
+        "trust_score": selected.get("trust_score"),
+        "is_trusted_whale": selected.get("is_trusted_whale"),
+        "side_label": selected.get("side_label"),
+        "market_slug": selected.get("market_slug"),
+        "source": "semi_live_whale_entry_sequence",
+    }
+
+
+def _attach_entry_anchor_to_prediction_case(
+    prediction: dict[str, Any],
+    *,
+    side_sequence: dict[str, Any] | None,
+    fallback_anchor: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach live whale entry timing to one ML prediction case."""
+    item = dict(prediction)
+    entry_anchor = (
+        side_sequence.get("entry_anchor")
+        if isinstance(side_sequence, dict) and isinstance(side_sequence.get("entry_anchor"), dict)
+        else None
+    )
+    existing_anchor = _entry_anchor_from_prediction_row(item)
+    selected_anchor = entry_anchor or existing_anchor or (fallback_anchor if fallback_anchor.get("available") else {})
+    anchor_time = str(selected_anchor.get("event_time") or item.get("observation_time") or "")
+    window_hours = _prediction_window_hours(str(item.get("window") or ""))
+    item["whale_entry_time"] = selected_anchor.get("event_time")
+    item["whale_entry_age_hours"] = selected_anchor.get("age_hours")
+    item["whale_entry_odds_pct"] = selected_anchor.get("odds_pct")
+    item["whale_entry_notional"] = selected_anchor.get("notional_value")
+    item["whale_entry_weighted_notional"] = selected_anchor.get("weighted_notional")
+    item["whale_entry_trust_score"] = selected_anchor.get("trust_score")
+    item["whale_entry_is_trusted"] = selected_anchor.get("is_trusted_whale")
+    item["prediction_start_time"] = anchor_time or item.get("observation_time")
+    item["prediction_target_time"] = _add_hours_iso(anchor_time or str(item.get("observation_time") or ""), window_hours)
+    item["prediction_window_hours"] = window_hours
+    item["prediction_timeline_source"] = (
+        "semi_live_whale_entry_time"
+        if selected_anchor.get("event_time")
+        else "local_backtest_observation_time"
+    )
+    if isinstance(side_sequence, dict):
+        item["live_window_features"] = side_sequence.get("window_features") or {}
+    return item
+
+
+def _entry_anchor_from_prediction_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Return a saved whale entry anchor from a prediction row when one exists."""
+    whale_anchor = row.get("whale_anchor") if isinstance(row.get("whale_anchor"), dict) else {}
+    live_features = row.get("live_window_features") if isinstance(row.get("live_window_features"), dict) else {}
+    event_time = row.get("whale_entry_time") or whale_anchor.get("latest_entry_time") or live_features.get("latest_entry_time")
+    if not event_time:
+        return {}
+    return {
+        "available": True,
+        "event_type": "entry",
+        "event_time": event_time,
+        "age_hours": row.get("whale_entry_age_hours"),
+        "odds_pct": row.get("whale_entry_odds_pct"),
+        "notional_value": row.get("whale_entry_notional") or whale_anchor.get("side_entry_pressure"),
+        "weighted_notional": row.get("whale_entry_weighted_notional") or whale_anchor.get("side_total_pressure"),
+        "trust_score": row.get("whale_entry_trust_score"),
+        "is_trusted_whale": row.get("whale_entry_is_trusted"),
+        "side_label": row.get("side_label"),
+        "market_slug": row.get("market_slug"),
+        "source": "persisted_ml_prediction_snapshot",
+    }
+
+
+def _prediction_windows_have_entry_anchor(windows: dict[str, Any]) -> bool:
+    """Return true when saved prediction rows already include whale entry timing."""
+    for rows in windows.values():
+        for row in rows or []:
+            if isinstance(row, dict) and _entry_anchor_from_prediction_row(row):
+                return True
+    return False
+
+
+def _prediction_anchor_from_windows(windows: dict[str, Any]) -> dict[str, Any]:
+    """Build a primary whale-entry anchor from saved prediction rows."""
+    anchors: list[dict[str, Any]] = []
+    for rows in windows.values():
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            anchor = _entry_anchor_from_prediction_row(row)
+            if anchor:
+                anchors.append(anchor)
+    if not anchors:
+        return {"available": False, "reason": "no_saved_whale_entry_anchor"}
+    return max(anchors, key=lambda item: str(item.get("event_time") or ""))
+
+
+def _ml_prediction_snapshot_table_exists(session: Session) -> bool:
+    """Return whether the persistent ML snapshot table is installed."""
+    try:
+        row = session.execute(
+            text("SELECT to_regclass('analytics.ml_market_prediction_snapshot') IS NOT NULL AS table_exists")
+        ).mappings().first()
+    except SQLAlchemyError:
+        return False
+    return bool(row and row.get("table_exists"))
+
+
+def _ml_prediction_validation_table_exists(session: Session) -> bool:
+    """Return whether the persistent ML validation table is installed."""
+    try:
+        row = session.execute(
+            text("SELECT to_regclass('analytics.ml_market_prediction_validation') IS NOT NULL AS table_exists")
+        ).mappings().first()
+    except SQLAlchemyError:
+        return False
+    return bool(row and row.get("table_exists"))
+
+
+def _isoformat(value: Any) -> str | None:
+    """Return an ISO timestamp for datetime-like values."""
+    return value.isoformat() if hasattr(value, "isoformat") else None
+
+
+def _float_or_none(value: Any) -> float | None:
+    """Return a nullable float for DB numeric fields."""
+    return float(value) if value is not None else None
+
+
+def _validation_reference_payload(row: Any) -> dict[str, Any]:
+    """Return a compact latest-completed prediction validation payload."""
+    mapping = row._mapping if hasattr(row, "_mapping") else row
+    window_hours = int(mapping["prediction_window_hours"])
+    return {
+        "ml_market_prediction_snapshot_id": int(mapping["ml_market_prediction_snapshot_id"]),
+        "window": f"{window_hours}h",
+        "side_label": mapping["side_label"],
+        "observation_time": _isoformat(mapping["observation_time"]),
+        "prediction_start_time": _isoformat(mapping["observation_time"]),
+        "prediction_target_time": _isoformat(mapping["prediction_target_time"]),
+        "prediction_generated_at": _isoformat(mapping["prediction_generated_at"]),
+        "prediction_window_hours": window_hours,
+        "current_odds_pct": _float_or_none(mapping["current_odds_pct"]),
+        "model_predicted_future_odds_pct": _float_or_none(mapping["predicted_future_odds_pct"]),
+        "model_predicted_delta_pts": _float_or_none(mapping["predicted_delta_pts"]),
+        "predicted_direction": mapping["predicted_direction"],
+        "actual_future_odds_pct": _float_or_none(mapping["actual_future_odds_pct"]),
+        "actual_delta_pts": _float_or_none(mapping["actual_delta_pts"]),
+        "actual_direction": mapping["actual_direction"],
+        "prediction_signed_error_pts": _float_or_none(mapping["signed_error_pts"]),
+        "prediction_absolute_error_pts": _float_or_none(mapping["absolute_error_pts"]),
+        "prediction_direction_match": mapping["direction_match"],
+        "prediction_validation_status": mapping["validation_status"],
+        "actual_source": mapping["actual_source"],
+        "actual_observed_at": _isoformat(mapping["actual_observed_at"]),
+        "comparison_type": "latest_completed_window",
+    }
+
+
+def _latest_completed_prediction_validations(
+    session: Session,
+    *,
+    market_slug: str,
+) -> dict[tuple[int, str], dict[str, Any]]:
+    """Return latest validated prediction checks by window and side for one market."""
+    if not _ml_prediction_validation_table_exists(session):
+        return {}
+    rows = session.execute(
+        text(
+            """
+            WITH ranked AS (
+              SELECT
+                s.ml_market_prediction_snapshot_id,
+                s.side_label,
+                s.prediction_window_hours,
+                s.observation_time,
+                s.prediction_target_time,
+                s.prediction_generated_at,
+                s.current_odds_pct,
+                s.predicted_future_odds_pct,
+                s.predicted_delta_pts,
+                v.actual_future_odds_pct,
+                v.actual_delta_pts,
+                v.signed_error_pts,
+                v.absolute_error_pts,
+                v.predicted_direction,
+                v.actual_direction,
+                v.direction_match,
+                v.validation_status,
+                v.actual_source,
+                v.actual_observed_at,
+                ROW_NUMBER() OVER (
+                  PARTITION BY s.prediction_window_hours, lower(s.side_label)
+                  ORDER BY
+                    COALESCE(s.prediction_target_time, s.prediction_generated_at) DESC,
+                    v.validated_at DESC,
+                    s.ml_market_prediction_snapshot_id DESC
+                ) AS rn
+              FROM analytics.ml_market_prediction_snapshot s
+              JOIN analytics.ml_market_prediction_validation v
+                ON v.ml_market_prediction_snapshot_id = s.ml_market_prediction_snapshot_id
+              WHERE lower(s.market_slug) = :market_slug
+                AND v.validation_status = 'validated'
+                AND v.actual_future_odds_pct IS NOT NULL
+            )
+            SELECT *
+            FROM ranked
+            WHERE rn = 1
+            """
+        ),
+        {"market_slug": market_slug},
+    ).fetchall()
+    return {
+        (int(row.prediction_window_hours), str(row.side_label or "").strip().casefold()): _validation_reference_payload(row)
+        for row in rows
+    }
+
+
+def _recent_prediction_validation_summary(
+    session: Session,
+    *,
+    market_slug: str,
+    window_hours: int = 12,
+    limit: int = 12,
+) -> dict[str, Any] | None:
+    """Return recent completed model-vs-actual validation metrics for one market."""
+    if not _ml_prediction_validation_table_exists(session):
+        return None
+    row = session.execute(
+        text(
+            """
+            WITH recent AS (
+              SELECT
+                v.direction_match,
+                v.absolute_error_pts,
+                v.actual_observed_at,
+                v.validated_at
+              FROM analytics.ml_market_prediction_validation v
+              WHERE lower(v.market_slug) = :market_slug
+                AND v.prediction_window_hours = :window_hours
+                AND v.validation_status = 'validated'
+                AND v.actual_future_odds_pct IS NOT NULL
+              ORDER BY
+                COALESCE(v.actual_observed_at, v.validated_at) DESC,
+                v.ml_market_prediction_validation_id DESC
+              LIMIT :limit
+            )
+            SELECT
+              COUNT(*) AS completed_count,
+              COALESCE(SUM(CASE WHEN direction_match IS TRUE THEN 1 ELSE 0 END), 0) AS direction_match_count,
+              AVG(absolute_error_pts) AS avg_absolute_error_pts,
+              MAX(validated_at) AS latest_validated_at,
+              MAX(actual_observed_at) AS latest_actual_observed_at
+            FROM recent
+            """
+        ),
+        {"market_slug": market_slug, "window_hours": window_hours, "limit": limit},
+    ).mappings().first()
+    if not row or int(row["completed_count"] or 0) <= 0:
+        return None
+    completed_count = int(row["completed_count"] or 0)
+    direction_match_count = int(row["direction_match_count"] or 0)
+    direction_match_rate_pct = round((direction_match_count / completed_count) * 100.0, 1)
+    avg_absolute_error_pts = _float_or_none(row["avg_absolute_error_pts"])
+    return {
+        "window_hours": int(window_hours),
+        "sample_size": completed_count,
+        "sample_limit": int(limit),
+        "direction_match_count": direction_match_count,
+        "direction_match_rate_pct": direction_match_rate_pct,
+        "avg_absolute_error_pts": round(avg_absolute_error_pts, 2) if avg_absolute_error_pts is not None else None,
+        "latest_validated_at": _isoformat(row["latest_validated_at"]),
+        "latest_actual_observed_at": _isoformat(row["latest_actual_observed_at"]),
+        "summary_label": f"Last {completed_count} completed {window_hours}h checks",
+    }
+
+
+def _latest_market_prediction_snapshot_payload(session: Session, market_slug: str) -> dict[str, Any] | None:
+    """Return the latest persisted ML prediction snapshot payload for one market."""
+    normalized_slug = str(market_slug or "").strip().casefold()
+    if not normalized_slug or not _ml_prediction_snapshot_table_exists(session):
+        return None
+    latest_generated_at = session.scalar(
+        select(MlMarketPredictionSnapshot.prediction_generated_at)
+        .where(MlMarketPredictionSnapshot.market_slug == normalized_slug)
+        .order_by(desc(MlMarketPredictionSnapshot.prediction_generated_at))
+        .limit(1)
+    )
+    if latest_generated_at is None:
+        latest_generated_at = session.scalar(
+            select(MlMarketPredictionSnapshot.prediction_generated_at)
+            .where(func.lower(MlMarketPredictionSnapshot.market_slug) == normalized_slug)
+            .order_by(desc(MlMarketPredictionSnapshot.prediction_generated_at))
+            .limit(1)
+        )
+    if latest_generated_at is None:
+        return None
+    rows = list(
+        session.scalars(
+            select(MlMarketPredictionSnapshot)
+            .where(
+                MlMarketPredictionSnapshot.market_slug == normalized_slug,
+                MlMarketPredictionSnapshot.prediction_generated_at == latest_generated_at,
+            )
+            .order_by(
+                MlMarketPredictionSnapshot.prediction_window_hours,
+                MlMarketPredictionSnapshot.side_label,
+                MlMarketPredictionSnapshot.ml_market_prediction_snapshot_id,
+            )
+        )
+    )
+    if not rows:
+        rows = list(
+            session.scalars(
+                select(MlMarketPredictionSnapshot)
+                .where(
+                    func.lower(MlMarketPredictionSnapshot.market_slug) == normalized_slug,
+                    MlMarketPredictionSnapshot.prediction_generated_at == latest_generated_at,
+                )
+                .order_by(
+                    MlMarketPredictionSnapshot.prediction_window_hours,
+                    MlMarketPredictionSnapshot.side_label,
+                    MlMarketPredictionSnapshot.ml_market_prediction_snapshot_id,
+                )
+            )
+        )
+    if not rows:
+        return None
+
+    validation_by_snapshot_id: dict[int, MlMarketPredictionValidation] = {}
+    if _ml_prediction_validation_table_exists(session):
+        validation_rows = list(
+            session.scalars(
+                select(MlMarketPredictionValidation).where(
+                    MlMarketPredictionValidation.ml_market_prediction_snapshot_id.in_(
+                        [row.ml_market_prediction_snapshot_id for row in rows]
+                    )
+                )
+            )
+        )
+        validation_by_snapshot_id = {
+            row.ml_market_prediction_snapshot_id: row
+            for row in validation_rows
+        }
+    latest_validation_by_key = _latest_completed_prediction_validations(session, market_slug=normalized_slug)
+
+    windows: dict[str, list[dict[str, Any]]] = {"12h": [], "24h": []}
+    model_prediction_available = False
+    statuses: set[str] = set()
+    for row in rows:
+        window_name = f"{int(row.prediction_window_hours)}h"
+        payload = dict(row.prediction_payload or {})
+        current_odds_pct = float(row.current_odds_pct) if row.current_odds_pct is not None else None
+        predicted_future_odds_pct = (
+            float(row.predicted_future_odds_pct)
+            if row.predicted_future_odds_pct is not None
+            else current_odds_pct
+        )
+        if "window" not in payload:
+            payload["window"] = window_name
+        if "market_slug" not in payload:
+            payload["market_slug"] = row.market_slug
+        if "side_label" not in payload:
+            payload["side_label"] = row.side_label
+        if payload.get("current_odds_pct") is None:
+            payload["current_odds_pct"] = current_odds_pct
+        if payload.get("predicted_future_odds_pct") is None:
+            payload["predicted_future_odds_pct"] = predicted_future_odds_pct
+        if payload.get("predicted_delta_pts") is None:
+            payload["predicted_delta_pts"] = float(row.predicted_delta_pts) if row.predicted_delta_pts is not None else 0.0
+        payload["ml_market_prediction_snapshot_id"] = row.ml_market_prediction_snapshot_id
+        payload["model_predicted_future_odds_pct"] = predicted_future_odds_pct
+        payload["model_predicted_delta_pts"] = (
+            float(row.predicted_delta_pts)
+            if row.predicted_delta_pts is not None
+            else payload.get("predicted_delta_pts")
+        )
+        validation = validation_by_snapshot_id.get(row.ml_market_prediction_snapshot_id)
+        if validation is not None:
+            payload["actual_future_odds_pct"] = (
+                float(validation.actual_future_odds_pct)
+                if validation.actual_future_odds_pct is not None
+                else None
+            )
+            payload["actual_delta_pts"] = (
+                float(validation.actual_delta_pts)
+                if validation.actual_delta_pts is not None
+                else None
+            )
+            payload["prediction_signed_error_pts"] = (
+                float(validation.signed_error_pts)
+                if validation.signed_error_pts is not None
+                else None
+            )
+            payload["prediction_absolute_error_pts"] = (
+                float(validation.absolute_error_pts)
+                if validation.absolute_error_pts is not None
+                else None
+            )
+            payload["prediction_direction_match"] = validation.direction_match
+            payload["actual_direction"] = validation.actual_direction
+            payload["prediction_validation_status"] = validation.validation_status
+            payload["actual_source"] = validation.actual_source
+            payload["actual_observed_at"] = validation.actual_observed_at.isoformat() if validation.actual_observed_at else None
+            payload["prediction_validation_comparison_type"] = "current_snapshot"
+        validation_key = (int(row.prediction_window_hours), str(row.side_label or "").strip().casefold())
+        latest_reference = latest_validation_by_key.get(validation_key)
+        if latest_reference is not None:
+            payload["latest_completed_validation"] = latest_reference
+        payload.setdefault("predicted_direction", "flat")
+        payload.setdefault("direction_signal_tier", row.signal_tier)
+        payload.setdefault("display_tier", row.display_tier)
+        payload.setdefault("prediction_status", row.prediction_status)
+        payload.setdefault("prediction_source", row.prediction_source)
+        payload.setdefault("prediction_generated_at", row.prediction_generated_at.isoformat())
+        payload.setdefault("model_version", row.model_version)
+        payload.setdefault("feature_schema_version", row.feature_schema_version)
+        payload.setdefault("data_freshness_status", row.data_freshness_status)
+        _apply_market_profile_reliability_policy(payload)
+        statuses.add(row.prediction_status)
+        if row.predicted_future_odds_pct is not None:
+            model_prediction_available = True
+        windows.setdefault(window_name, []).append(payload)
+
+    primary_status = "prediction_available" if model_prediction_available else sorted(statuses)[0]
+    return {
+        "available": True,
+        "reason": None if model_prediction_available else primary_status,
+        "market_slug": normalized_slug,
+        "question": rows[0].prediction_payload.get("question") if isinstance(rows[0].prediction_payload, dict) else None,
+        "generated_at": latest_generated_at.isoformat(),
+        "report_status": "persisted_prediction_snapshot",
+        "model_name": rows[0].model_version,
+        "source": "analytics.ml_market_prediction_snapshot",
+        "production_use": False,
+        "local_backtest_only": False,
+        "snapshot_row_count": len(rows),
+        "model_prediction_available": model_prediction_available,
+        "prediction_status": primary_status,
+        "windows": windows,
+    }
+
+def _apply_live_polymarket_prediction_overlay(
+    windows: dict[str, list[dict[str, Any]]],
+    *,
+    live_market: LivePolymarketMarket | None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Re-anchor prediction rows to live Polymarket outcome prices."""
+    if live_market is None:
+        return windows
+
+    adjusted: dict[str, list[dict[str, Any]]] = {}
+    for window_name, rows in windows.items():
+        adjusted_rows: list[dict[str, Any]] = []
+        for row in rows or []:
+            item = dict(row)
+            side_label = str(item.get("side_label") or "")
+            live_price = live_market.price_for_side(side_label)
+            if live_price is None:
+                adjusted_rows.append(item)
+                continue
+
+            live_current_pct = round(_clamp_pct(live_price * 100.0), 4)
+            original_current = _coerce_float(item.get("current_odds_pct"))
+            original_future = _coerce_float(item.get("predicted_future_odds_pct"))
+            original_delta = _coerce_float(item.get("predicted_delta_pts"))
+            if original_delta is None and original_current is not None and original_future is not None:
+                original_delta = original_future - original_current
+            if original_delta is None:
+                original_delta = 0.0
+            model_future = _coerce_float(item.get("model_predicted_future_odds_pct"))
+            model_delta = _coerce_float(item.get("model_predicted_delta_pts"))
+            item["model_predicted_future_odds_pct"] = (
+                model_future if model_future is not None else original_future
+            )
+            item["model_predicted_delta_pts"] = model_delta if model_delta is not None else original_delta
+
+            if live_market.question:
+                item["question"] = f"{live_market.question} [{side_label}]" if side_label else live_market.question
+            item["current_odds_pct"] = live_current_pct
+            item["data_freshness_status"] = "polymarket_gamma_live_overlay"
+            item["prediction_timeline_source"] = "polymarket_gamma_live_current_odds"
+            item["live_polymarket_updated_at"] = live_market.updated_at.isoformat() if live_market.updated_at else None
+            item["live_polymarket_closed"] = bool(live_market.closed)
+
+            warnings = list(item.get("reliability_warnings") or [])
+            if live_market.closed:
+                _append_unique(warnings, "market_closed")
+                item["predicted_future_odds_pct"] = live_current_pct
+                item["predicted_delta_pts"] = 0.0
+                item["predicted_direction"] = "flat"
+                item["overlay_future_odds_pct"] = live_current_pct
+                item["overlay_delta_pts"] = 0.0
+                item["overlay_direction"] = "flat"
+                item["interval_low_future_odds_pct"] = live_current_pct
+                item["interval_high_future_odds_pct"] = live_current_pct
+                item["direction_signal_tier"] = "abstain"
+                item["direction_signal_tier_reason"] = "market is closed; live Polymarket outcome price is final"
+                item["direction_signal_predicted_direction"] = "flat"
+                item["direction_signal_confidence"] = 0.0
+                item["prediction_status"] = "market_closed_live_outcome"
+                item["display_tier"] = "review"
+                item["display_reasons"] = ["market_closed_live_outcome"]
+                item["review_reasons"] = ["market_closed"]
+                item["historical_validation_tier"] = "market_closed"
+                item["historical_validation_reason"] = "market is closed; live Polymarket outcome price is final"
+                item["historical_validation_direction_match_pct"] = None
+                item["historical_validation_sample_size"] = None
+            else:
+                predicted_future = round(_clamp_pct(live_current_pct + original_delta), 4)
+                adjusted_delta = round(predicted_future - live_current_pct, 4)
+                item["predicted_future_odds_pct"] = predicted_future
+                item["predicted_delta_pts"] = adjusted_delta
+                item["predicted_direction"] = _direction_from_delta(adjusted_delta)
+                item["overlay_future_odds_pct"] = predicted_future
+                item["overlay_delta_pts"] = adjusted_delta
+                item["overlay_direction"] = item["predicted_direction"]
+                original_low = _coerce_float(item.get("interval_low_future_odds_pct"))
+                original_high = _coerce_float(item.get("interval_high_future_odds_pct"))
+                if original_low is not None and original_high is not None and original_future is not None:
+                    item["interval_low_future_odds_pct"] = round(
+                        _clamp_pct(predicted_future - max(original_future - original_low, 0.0)),
+                        4,
+                    )
+                    item["interval_high_future_odds_pct"] = round(
+                        _clamp_pct(predicted_future + max(original_high - original_future, 0.0)),
+                        4,
+                    )
+                else:
+                    item["interval_low_future_odds_pct"] = predicted_future
+                    item["interval_high_future_odds_pct"] = predicted_future
+                _append_unique(warnings, "live_polymarket_price_overlay")
+            item["reliability_warnings"] = warnings
+            if not live_market.closed:
+                _apply_market_profile_reliability_policy(item)
+            adjusted_rows.append(item)
+        adjusted[window_name] = adjusted_rows
+    return adjusted
+
+
+def _baseline_side_labels(contract: MarketContract | None) -> list[str]:
+    """Return side labels for a current-odds ML fallback chart."""
+    if contract is None:
+        return []
+    labels = [str(contract.outcome_a_label or "").strip(), str(contract.outcome_b_label or "").strip()]
+    labels = [label for label in labels if label]
+    return labels or ["Yes", "No"]
+
+
+def _baseline_current_odds_pct(contract: MarketContract | None, side_label: str) -> float | None:
+    """Return current side odds in percentage points for a current-odds fallback chart."""
+    if contract is None or contract.last_trade_price is None:
+        return None
+    try:
+        price_pct = max(0.0, min(float(contract.last_trade_price) * 100.0, 100.0))
+    except (TypeError, ValueError):
+        return None
+    outcome_a = str(contract.outcome_a_label or "Yes").strip().casefold()
+    if str(side_label or "").strip().casefold() == outcome_a:
+        return round(price_pct, 4)
+    return round(100.0 - price_pct, 4)
+
+
+def _current_odds_baseline_windows(
+    *,
+    contract: MarketContract | None,
+    market_slug: str,
+    anchor: dict[str, Any],
+) -> dict[str, list[dict[str, Any]]]:
+    """Return flat 12h/24h fallback rows when no ML snapshot exists."""
+    if contract is None:
+        return {"12h": [], "24h": []}
+    observation_time = contract.updated_at or datetime.now(timezone.utc)
+    event_category = "uncategorized"
+    windows: dict[str, list[dict[str, Any]]] = {"12h": [], "24h": []}
+    for side_label in _baseline_side_labels(contract):
+        current_odds_pct = _baseline_current_odds_pct(contract, side_label)
+        if current_odds_pct is None:
+            continue
+        for window_hours in (12, 24):
+            window_name = f"{window_hours}h"
+            target_time = observation_time + timedelta(hours=window_hours)
+            row = {
+                "window": window_name,
+                "market_slug": str(market_slug or contract.market_slug or "").strip().casefold(),
+                "question": contract.question,
+                "side_label": side_label,
+                "observation_time": observation_time.isoformat(),
+                "event_category": event_category,
+                "focus_category": event_category,
+                "focused_fit_category": event_category,
+                "market_family": event_category,
+                "current_odds_pct": current_odds_pct,
+                "predicted_future_odds_pct": current_odds_pct,
+                "predicted_delta_pts": 0.0,
+                "predicted_direction": "flat",
+                "prediction_source": "current_odds_baseline",
+                "display_tier": "review",
+                "display_reasons": ["current_odds_baseline"],
+                "review_reasons": ["missing_ml_prediction_snapshot"],
+                "direction_signal_tier": "abstain",
+                "direction_signal_tier_reason": "no saved ML snapshot; showing current odds baseline",
+                "direction_signal_predicted_direction": "flat",
+                "direction_signal_confidence": 0.0,
+                "reliability_warnings": ["missing_ml_prediction_snapshot", "no_recent_whale_signal_for_side"],
+                "overlay_future_odds_pct": current_odds_pct,
+                "overlay_delta_pts": 0.0,
+                "overlay_direction": "flat",
+                "interval_low_future_odds_pct": current_odds_pct,
+                "interval_high_future_odds_pct": current_odds_pct,
+                "trend_fit_error_type": "current_odds_baseline",
+                "trend_shape_score": 0.0,
+                "whale_anchor": {},
+                "local_backtest_only": False,
+                "prediction_start_time": observation_time.isoformat(),
+                "prediction_target_time": target_time.isoformat(),
+                "prediction_window_hours": window_hours,
+                "prediction_timeline_source": "current_market_contract_snapshot",
+                "prediction_status": "current_odds_baseline_available",
+            }
+            windows[window_name].append(
+                _attach_entry_anchor_to_prediction_case(
+                    row,
+                    side_sequence=None,
+                    fallback_anchor=anchor,
+                )
+            )
+    return windows
+
+
+def _market_profile_ml_trend_payload(
+    session: Session,
+    market_slug: str,
+    contract: MarketContract | None = None,
+) -> dict[str, Any]:
+    """Return server-shaped whale entry plus 12h/24h trend predictions."""
+    live_market = fetch_live_polymarket_market_by_slug(market_slug)
+    persisted_prediction = _latest_market_prediction_snapshot_payload(session, market_slug)
+    local_prediction = persisted_prediction or market_profile_ml_trend(market_slug)
+    saved_windows = local_prediction.get("windows") if isinstance(local_prediction.get("windows"), dict) else {}
+    has_saved_entry_anchor = _prediction_windows_have_entry_anchor(saved_windows)
+    if has_saved_entry_anchor or persisted_prediction:
+        live_sequence = {
+            "available": False,
+            "reason": (
+                "using_saved_ml_prediction_whale_entry_anchor"
+                if has_saved_entry_anchor
+                else "using_saved_ml_prediction_without_live_sequence_scan"
+            ),
+            "semi_live": False,
+            "source": "persisted_ml_prediction_snapshot",
+            "items": [],
+        }
+    else:
+        live_sequence = whale_event_sequence_for_market(
+            session,
+            market_slug=market_slug,
+            lookback_hours=72,
+            bucket_hours=1,
+            trusted_only=False,
+            platform_name="polymarket",
+        )
+    compact_items = [_compact_sequence_item(item) for item in live_sequence.get("items") or [] if isinstance(item, dict)]
+    sequence_by_side = {
+        _normalize_side_label(str(item.get("side_label") or "")): item
+        for item in compact_items
+    }
+    anchor = (
+        _prediction_anchor_from_windows(saved_windows)
+        if has_saved_entry_anchor
+        else _primary_whale_entry_anchor({"items": compact_items, "reason": live_sequence.get("reason")})
+    )
+
+    windows: dict[str, list[dict[str, Any]]] = {"12h": [], "24h": []}
+    for window_name, rows in ((local_prediction.get("windows") or {}).items() if local_prediction.get("available") else []):
+        enriched_rows = [
+            _attach_entry_anchor_to_prediction_case(
+                row,
+                side_sequence=sequence_by_side.get(_normalize_side_label(str(row.get("side_label") or ""))),
+                fallback_anchor=anchor,
+            )
+            for row in rows or []
+            if isinstance(row, dict)
+        ]
+        windows[str(window_name)] = enriched_rows
+
+    chart_available = any(windows.get(window_name) for window_name in ("12h", "24h"))
+    baseline_available = False
+    if not chart_available:
+        windows = _current_odds_baseline_windows(contract=contract, market_slug=market_slug, anchor=anchor)
+        baseline_available = any(windows.get(window_name) for window_name in ("12h", "24h"))
+        chart_available = baseline_available
+    windows = _apply_live_polymarket_prediction_overlay(windows, live_market=live_market)
+    recent_12h_validation = _recent_prediction_validation_summary(
+        session,
+        market_slug=str(market_slug or "").strip().casefold(),
+        window_hours=12,
+        limit=12,
+    )
+    market_is_closed = bool(live_market.closed) if live_market is not None else bool(contract and contract.is_closed)
+    model_prediction_available = bool(local_prediction.get("model_prediction_available", chart_available))
+    base_prediction_status = str(local_prediction.get("prediction_status") or "")
+    if market_is_closed and chart_available:
+        model_prediction_available = False
+        prediction_status = "market_closed_live_outcome"
+    elif baseline_available:
+        model_prediction_available = False
+        prediction_status = "current_odds_baseline_available"
+    elif chart_available and not model_prediction_available and base_prediction_status:
+        prediction_status = base_prediction_status
+    elif chart_available and anchor.get("available"):
+        prediction_status = "entry_anchored_prediction_available"
+    elif chart_available:
+        prediction_status = "prediction_available_without_recent_whale_entry"
+    elif anchor.get("available"):
+        prediction_status = "waiting_for_ml_prediction_snapshot"
+    else:
+        prediction_status = "waiting_for_whale_entry_and_prediction_snapshot"
+
+    return {
+        **local_prediction,
+        "available": chart_available,
+        "reason": None if chart_available else local_prediction.get("reason"),
+        "market_slug": str(market_slug or "").strip().casefold(),
+        "production_use": False,
+        "local_backtest_only": False if baseline_available else bool(local_prediction.get("local_backtest_only", True)),
+        "server_ready_shape": True,
+        "model_prediction_available": model_prediction_available,
+        "prediction_status": prediction_status,
+        "outcome_probabilities": live_market.outcome_probabilities() if live_market is not None else None,
+        "primary_side_label": live_market.primary_side_label() if live_market is not None else None,
+        "live_polymarket_updated_at": live_market.updated_at.isoformat() if live_market and live_market.updated_at else None,
+        "live_polymarket_closed": market_is_closed,
+        "recent_12h_validation": recent_12h_validation,
+        "prediction_anchor": anchor,
+        "live_whale_sequence": {
+            "available": bool(live_sequence.get("available")),
+            "reason": live_sequence.get("reason"),
+            "semi_live": bool(live_sequence.get("semi_live")),
+            "as_of": live_sequence.get("as_of"),
+            "generated_at": live_sequence.get("generated_at"),
+            "lookback_hours": live_sequence.get("lookback_hours"),
+            "sequence_count": live_sequence.get("sequence_count"),
+            "queried_event_rows": live_sequence.get("queried_event_rows"),
+            "source": live_sequence.get("source"),
+            "items": compact_items,
+        },
+        "windows": windows,
+    }
+
+
+def market_profile_ml_trend_payload(session: Session, *, market_slug: str) -> dict[str, Any]:
+    """Return ML trend data for the market-profile prediction tab."""
+    contract = session.scalars(
+        select(MarketContract)
+        .where(MarketContract.market_slug == market_slug)
+        .order_by(desc(MarketContract.updated_at), desc(MarketContract.market_contract_id))
+        .limit(1)
+    ).first()
+    return _market_profile_ml_trend_payload(session, market_slug, contract=contract)
+
+
+def _normalize_watchlist_user_ids(values: list[int] | None) -> list[int]:
+    """Return unique positive integer user ids in stable order."""
+    seen: set[int] = set()
+    items: list[int] = []
+    for value in values or []:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed <= 0 or parsed in seen:
+            continue
+        seen.add(parsed)
+        items.append(parsed)
+    return items
+
+
+def _normalize_watchlist_market_slugs(values: list[str] | None) -> list[str]:
+    """Return unique normalized market slugs in stable order."""
+    seen: set[str] = set()
+    items: list[str] = []
+    for value in values or []:
+        if not isinstance(value, str):
+            continue
+        normalized = value.strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        items.append(normalized)
+    return items
+
+
+def _resolved_result_label(
+    resolved_outcomes: dict[str, str],
+    *,
+    condition_ref: str | None,
+    outcome_a_label: str | None,
+    outcome_b_label: str | None,
+) -> str:
+    """Return a readable resolved outcome label for a market contract."""
+    if not condition_ref:
+        return "Pending"
+    winning_outcome = resolved_outcomes.get(condition_ref)
+    if not winning_outcome:
+        return "Pending"
+
+    normalized_a = outcome_a_label.strip().lower() if isinstance(outcome_a_label, str) and outcome_a_label.strip() else None
+    normalized_b = outcome_b_label.strip().lower() if isinstance(outcome_b_label, str) and outcome_b_label.strip() else None
+    if normalized_a == winning_outcome:
+        return outcome_a_label or winning_outcome.title()
+    if normalized_b == winning_outcome:
+        return outcome_b_label or winning_outcome.title()
+    return winning_outcome.title()
+
+
+def database_health(session: Session) -> bool:
+    """Return whether the database responds to a trivial query."""
+    session.execute(text("SELECT 1"))
+    return True
+
+
+def latest_scrape_run(session: Session) -> dict[str, Any] | None:
+    """Return the latest scrape run summary."""
+    row = session.scalars(select(ScrapeRun).order_by(desc(ScrapeRun.started_at)).limit(1)).first()
+    if row is None:
+        return None
+    observed_at = row.finished_at or row.started_at
+    payload = {
+        "scrape_run_id": row.scrape_run_id,
+        "job_name": row.job_name,
+        "endpoint_name": row.endpoint_name,
+        "status": row.status,
+        "started_at": row.started_at.isoformat() if row.started_at else None,
+        "finished_at": row.finished_at.isoformat() if row.finished_at else None,
+        "records_written": row.records_written,
+        "error_count": row.error_count,
+        "error_summary": row.error_summary,
+    }
+    payload.update(
+        _freshness_metadata(
+            observed_at=observed_at,
+            threshold_minutes=settings.trade_feed_stale_minutes,
+            freshness_source="analytics.scrape_run.finished_at",
+            last_successful_ingest_at=_latest_successful_scrape_time(session),
+        )
+    )
+    return payload
+
+
+def list_markets(session: Session, limit: int = DEFAULT_LIMIT) -> list[dict[str, Any]]:
+    """Return recent market contracts."""
+    rows = session.scalars(select(MarketContract).order_by(desc(MarketContract.updated_at)).limit(limit)).all()
+    return [
+        {
+            "market_contract_id": row.market_contract_id,
+            "external_market_ref": row.external_market_ref,
+            "market_slug": row.market_slug,
+            "question": row.question,
+            "is_active": row.is_active,
+            "is_closed": row.is_closed,
+            "last_trade_price": float(row.last_trade_price) if row.last_trade_price is not None else None,
+            "volume": float(row.volume) if row.volume is not None else None,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        }
+        for row in rows
+    ]
+
+
+def list_users(session: Session, limit: int = DEFAULT_LIMIT) -> list[dict[str, Any]]:
+    """Return recent users."""
+    rows = session.scalars(select(UserAccount).order_by(desc(UserAccount.updated_at)).limit(limit)).all()
+    return [
+        {
+            "user_id": row.user_id,
+            "external_user_ref": row.external_user_ref,
+            "wallet_address": row.wallet_address,
+            "preferred_username": row.preferred_username,
+            "display_label": row.display_label,
+            "is_active": row.is_active,
+            "is_likely_insider": row.is_likely_insider,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        }
+        for row in rows
+    ]
+
+
+def list_transactions(session: Session, limit: int = DEFAULT_LIMIT) -> list[dict[str, Any]]:
+    """Return recent normalized transactions."""
+    rows = session.scalars(select(TransactionFact).order_by(desc(TransactionFact.transaction_time)).limit(limit)).all()
+    return [
+        {
+            "transaction_id": row.transaction_id,
+            "user_id": row.user_id,
+            "market_contract_id": row.market_contract_id,
+            "source_transaction_id": row.source_transaction_id,
+            "transaction_type": row.transaction_type,
+            "side": row.side,
+            "price": float(row.price) if row.price is not None else None,
+            "shares": float(row.shares) if row.shares is not None else None,
+            "notional_value": float(row.notional_value) if row.notional_value is not None else None,
+            "transaction_time": row.transaction_time.isoformat() if row.transaction_time else None,
+        }
+        for row in rows
+    ]
+
+
+def list_positions(session: Session, limit: int = DEFAULT_LIMIT) -> list[dict[str, Any]]:
+    """Return recent position snapshots."""
+    rows = session.scalars(
+        select(PositionSnapshot).order_by(desc(PositionSnapshot.snapshot_time), desc(PositionSnapshot.position_snapshot_id)).limit(limit)
+    ).all()
+    return [
+        {
+            "position_snapshot_id": row.position_snapshot_id,
+            "user_id": row.user_id,
+            "market_contract_id": row.market_contract_id,
+            "event_id": row.event_id,
+            "position_size": float(row.position_size) if row.position_size is not None else None,
+            "avg_entry_price": float(row.avg_entry_price) if row.avg_entry_price is not None else None,
+            "current_mark_price": float(row.current_mark_price) if row.current_mark_price is not None else None,
+            "market_value": float(row.market_value) if row.market_value is not None else None,
+            "cash_pnl": float(row.cash_pnl) if row.cash_pnl is not None else None,
+            "realized_pnl": float(row.realized_pnl) if row.realized_pnl is not None else None,
+            "unrealized_pnl": float(row.unrealized_pnl) if row.unrealized_pnl is not None else None,
+            "is_redeemable": row.is_redeemable,
+            "is_mergeable": row.is_mergeable,
+            "snapshot_time": row.snapshot_time.isoformat() if row.snapshot_time else None,
+        }
+        for row in rows
+    ]
+
+
+def latest_leaderboard(session: Session, *, board_type: str | None = None) -> dict[str, Any] | None:
+    """Return leaderboard rows for the latest dashboard snapshot."""
+    dashboard = session.scalars(select(Dashboard).order_by(desc(Dashboard.generated_at)).limit(1)).first()
+    if dashboard is None:
+        return None
+    statement = (
+        select(UserLeaderboard)
+        .where(UserLeaderboard.dashboard_id == dashboard.dashboard_id)
+        .order_by(UserLeaderboard.board_type.asc(), UserLeaderboard.rank.asc())
+        .limit(DEFAULT_LIMIT)
+    )
+    if board_type:
+        statement = (
+            select(UserLeaderboard)
+            .where(
+                UserLeaderboard.dashboard_id == dashboard.dashboard_id,
+                UserLeaderboard.board_type == board_type,
+            )
+            .order_by(UserLeaderboard.rank.asc())
+            .limit(DEFAULT_LIMIT)
+        )
+    rows = session.scalars(statement).all()
+    user_accounts = {
+        row.user_id: row
+        for row in session.scalars(
+            select(UserAccount).where(UserAccount.user_id.in_([row.user_id for row in rows]))
+        ).all()
+    } if rows else {}
+    return {
+        "dashboard_id": dashboard.dashboard_id,
+        "generated_at": dashboard.generated_at.isoformat(),
+        "timeframe": dashboard.timeframe,
+        "board_type": board_type or "all",
+        "rows": [
+            {
+                "leaderboard_id": row.leaderboard_id,
+                "user_id": row.user_id,
+                "external_user_ref": user_accounts.get(row.user_id).external_user_ref if user_accounts.get(row.user_id) else None,
+                "wallet_address": user_accounts.get(row.user_id).wallet_address if user_accounts.get(row.user_id) else None,
+                "preferred_username": user_accounts.get(row.user_id).preferred_username if user_accounts.get(row.user_id) else None,
+                "display_label": user_accounts.get(row.user_id).display_label if user_accounts.get(row.user_id) else None,
+                "board_type": row.board_type,
+                "rank": row.rank,
+                "score_metric": row.score_metric,
+                "score_value": float(row.score_value) if row.score_value is not None else None,
+            }
+            for row in rows
+        ],
+    }
+
+
+def latest_dashboard_snapshot(session: Session) -> dict[str, Any] | None:
+    """Return a summary of the latest dashboard snapshot."""
+    dashboard = session.scalars(select(Dashboard).order_by(desc(Dashboard.generated_at)).limit(1)).first()
+    if dashboard is None:
+        return None
+    market_count = session.scalar(
+        select(func.count(DashboardMarket.market_id)).where(DashboardMarket.dashboard_id == dashboard.dashboard_id)
+    )
+    payload = {
+        "dashboard_id": dashboard.dashboard_id,
+        "dashboard_date": dashboard.dashboard_date.isoformat(),
+        "generated_at": dashboard.generated_at.isoformat(),
+        "timeframe": dashboard.timeframe,
+        "scope_label": dashboard.scope_label,
+        "market_count": int(market_count or 0),
+    }
+    payload.update(
+        _freshness_metadata(
+            observed_at=dashboard.generated_at,
+            threshold_minutes=settings.analytics_stale_minutes,
+            freshness_source="analytics.dashboard.generated_at",
+            last_successful_ingest_at=_latest_successful_scrape_time(session),
+        )
+    )
+    return payload
+
+
+def latest_dashboard_markets(session: Session, limit: int = DEFAULT_LIMIT) -> dict[str, Any] | None:
+    """Return latest derived market rows from the dashboard layer."""
+    dashboard = session.scalars(select(Dashboard).order_by(desc(Dashboard.generated_at)).limit(1)).first()
+    if dashboard is None:
+        return None
+    last_successful_ingest_at = _latest_successful_scrape_time(session)
+    rows = session.execute(
+        select(DashboardMarket, MarketContract)
+        .join(MarketContract, MarketContract.market_contract_id == DashboardMarket.market_contract_id)
+        .where(DashboardMarket.dashboard_id == dashboard.dashboard_id)
+        .order_by(
+            desc(DashboardMarket.trusted_whale_count),
+            desc(DashboardMarket.whale_count),
+            desc(DashboardMarket.volume),
+            DashboardMarket.market_id.asc(),
+        )
+        .limit(limit)
+    ).all()
+    items = []
+    for market, contract in rows:
+        market_slug_value = market.market_slug or contract.market_slug
+        if market.volume is not None:
+            volume = float(market.volume)
+        elif contract.volume is not None:
+            volume = float(contract.volume)
+        else:
+            volume = _observed_trade_volume_for_market(
+                session,
+                contract=contract,
+                market_slug=market_slug_value,
+            )
+        if market.orderbook_depth is not None:
+            orderbook_depth = int(market.orderbook_depth or 0)
+        else:
+            orderbook_depth = _latest_orderbook_depth_for_market(
+                session,
+                contract=contract,
+                market_slug=market_slug_value,
+            )
+        item = {
+            "market_id": market.market_id,
+            "market_contract_id": market.market_contract_id,
+            "market_slug": market.market_slug,
+            "market_url": market.market_url,
+            "question": contract.question,
+            "price": float(market.price) if market.price is not None else None,
+            "volume": volume,
+            "odds": float(market.odds) if market.odds is not None else None,
+            "orderbook_depth": orderbook_depth,
+            "whale_count": int(market.whale_count or 0),
+            "trusted_whale_count": int(market.trusted_whale_count or 0),
+            "whale_market_focus": market.whale_market_focus,
+            "read_time": market.read_time.isoformat() if market.read_time else None,
+        }
+        item.update(
+            _freshness_metadata(
+                observed_at=market.read_time,
+                threshold_minutes=settings.market_stale_minutes,
+                freshness_source="analytics.dashboard_market.read_time",
+                last_successful_ingest_at=last_successful_ingest_at,
+            )
+        )
+        items.append(item)
+    payload = {
+        "dashboard_id": dashboard.dashboard_id,
+        "generated_at": dashboard.generated_at.isoformat(),
+        "count": len(items),
+        "items": items,
+    }
+    payload.update(
+        _freshness_metadata(
+            observed_at=dashboard.generated_at,
+            threshold_minutes=settings.analytics_stale_minutes,
+            freshness_source="analytics.dashboard.generated_at",
+            last_successful_ingest_at=last_successful_ingest_at,
+        )
+    )
+    return payload
+
+
+def home_summary(session: Session) -> dict[str, Any]:
+    """Return a compact homepage summary for the React dashboard."""
+    cached_summary = latest_home_summary_snapshot_payload(session)
+    if cached_summary is not None:
+        return cached_summary
+    return _live_home_summary(session)
+
+
+def _live_home_summary(session: Session) -> dict[str, Any]:
+    """Fallback summary path used before the first cached snapshot is built."""
+    latest_batch = _latest_whale_batch(session)
+    whales_detected = 0
+    trusted_whales = 0
+    top_trusted_whale: dict[str, Any] | None = None
+    scoring_version: str | None = None
+
+    if latest_batch is not None:
+        rows = session.execute(
+            select(WhaleScoreSnapshot, UserAccount)
+            .join(UserAccount, UserAccount.user_id == WhaleScoreSnapshot.user_id)
+            .where(
+                WhaleScoreSnapshot.snapshot_time == latest_batch.snapshot_time,
+                WhaleScoreSnapshot.scoring_version == latest_batch.scoring_version,
+            )
+            .order_by(desc(WhaleScoreSnapshot.trust_score), desc(WhaleScoreSnapshot.sample_trade_count))
+        ).all()
+        whales_detected = sum(1 for score, _ in rows if score.is_whale)
+        trusted_whales = sum(1 for score, _ in rows if score.is_trusted_whale)
+        scoring_version = latest_batch.scoring_version
+        trusted_rows = [(score, account) for score, account in rows if score.is_trusted_whale]
+        if trusted_rows:
+            score, account = trusted_rows[0]
+            top_trusted_whale = {
+                "user_id": account.user_id,
+                "external_user_ref": account.external_user_ref,
+                "wallet_address": account.wallet_address,
+                "preferred_username": account.preferred_username,
+                "display_label": account.display_label,
+                "trust_score": float(score.trust_score or 0),
+                "profitability_score": float(score.profitability_score or 0),
+                "sample_trade_count": int(score.sample_trade_count or 0),
+            }
+
+    latest_market_block = latest_dashboard_markets(session, limit=1)
+    most_whale_concentrated_market = None
+    if latest_market_block and latest_market_block["items"]:
+        market = latest_market_block["items"][0]
+        most_whale_concentrated_market = {
+            "market_slug": market["market_slug"],
+            "question": market["question"],
+            "whale_count": market["whale_count"],
+            "trusted_whale_count": market["trusted_whale_count"],
+            "price": market["price"],
+        }
+
+    _, profitability_summary = load_resolved_user_performance(session)
+
+    platform_rows = session.scalars(select(Platform).order_by(Platform.platform_name.asc())).all()
+    platform_coverage: list[dict[str, Any]] = []
+    for platform in platform_rows:
+        platform_coverage.append(
+            {
+                "platform_name": platform.platform_name,
+                "user_count": int(
+                    session.scalar(
+                        select(func.count(UserAccount.user_id)).where(UserAccount.platform_id == platform.platform_id)
+                    )
+                    or 0
+                ),
+                "market_count": int(
+                    session.scalar(
+                        select(func.count(MarketContract.market_contract_id)).where(
+                            MarketContract.platform_id == platform.platform_id
+                        )
+                    )
+                    or 0
+                ),
+                "transaction_count": int(
+                    session.scalar(
+                        select(func.count(TransactionFact.transaction_id)).where(
+                            TransactionFact.platform_id == platform.platform_id
+                        )
+                    )
+                    or 0
+                ),
+                "orderbook_snapshot_count": int(
+                    session.scalar(
+                        select(func.count(OrderbookSnapshot.orderbook_snapshot_id)).where(
+                            OrderbookSnapshot.platform_id == platform.platform_id
+                        )
+                    )
+                    or 0
+                ),
+            }
+        )
+
+    latest_ingestion = latest_scrape_run(session)
+    payload = {
+        "scoring_version": scoring_version,
+        "whales_detected": whales_detected,
+        "trusted_whales": trusted_whales,
+        "resolved_markets_available": profitability_summary["resolved_markets_available"],
+        "resolved_markets_observed": profitability_summary["resolved_markets_observed"],
+        "profitability_users": profitability_summary["profitability_users"],
+        "top_trusted_whale": top_trusted_whale,
+        "most_whale_concentrated_market": most_whale_concentrated_market,
+        "latest_ingestion": latest_ingestion,
+        "market_category_coverage": market_category_coverage_payload(session),
+        "platform_coverage": platform_coverage,
+    }
+    latest_dashboard = session.scalars(select(Dashboard).order_by(desc(Dashboard.generated_at)).limit(1)).first()
+    payload.update(
+        _freshness_metadata(
+            observed_at=latest_dashboard.generated_at if latest_dashboard is not None else None,
+            threshold_minutes=settings.analytics_stale_minutes,
+            freshness_source="analytics.dashboard.generated_at",
+            last_successful_ingest_at=_latest_successful_scrape_time(session),
+        )
+    )
+    return payload
+
+
+def top_profitable_resolved_users(
+    session: Session,
+    limit: int = DEFAULT_LIMIT,
+    *,
+    timeframe: str = "all",
+) -> dict[str, Any]:
+    """Return the top Polymarket users ranked by conservative resolved-market profitability."""
+    cached_payload = latest_research_analytics_view(
+        session,
+        timeframe=timeframe,
+        view_name="top_profitable_users",
+        limit=limit,
+    )
+    if cached_payload is not None:
+        return _with_current_whale_status(cached_payload)
+    return _live_top_profitable_resolved_users(session, limit=limit, timeframe=timeframe)
+
+
+def _live_top_profitable_resolved_users(
+    session: Session,
+    limit: int = DEFAULT_LIMIT,
+    *,
+    timeframe: str = "all",
+) -> dict[str, Any]:
+    """Return top resolved-market profitability using live transaction scans."""
+    start_time = timeframe_start(timeframe)
+    resolved_performance_by_user, profitability_summary = load_resolved_user_performance(
+        session,
+        start_time=start_time,
+    )
+    latest_batch = _latest_whale_batch(session)
+    if latest_batch is None:
+        return {
+            "scope": "polymarket_users",
+            "timeframe": timeframe,
+            "scoring_version": None,
+            "resolved_markets_observed": profitability_summary["resolved_markets_observed"],
+            "count": 0,
+            "items": [],
+        }
+
+    score_rows = session.execute(
+        select(WhaleScoreSnapshot, UserAccount, Platform)
+        .join(UserAccount, UserAccount.user_id == WhaleScoreSnapshot.user_id)
+        .join(Platform, Platform.platform_id == WhaleScoreSnapshot.platform_id)
+        .where(
+            WhaleScoreSnapshot.snapshot_time == latest_batch.snapshot_time,
+            WhaleScoreSnapshot.scoring_version == latest_batch.scoring_version,
+        )
+    ).all()
+    score_by_user = {
+        account.user_id: {
+            "score": score,
+            "account": account,
+            "platform": platform,
+        }
+        for score, account, platform in score_rows
+    }
+
+    ranked_items: list[dict[str, Any]] = []
+    for user_id, resolved in resolved_performance_by_user.items():
+        if resolved.resolved_market_count <= 0 or resolved.realized_pnl <= 0:
+            continue
+        row = score_by_user.get(user_id)
+        if row is None:
+            continue
+        win_rate = (
+            resolved.winning_market_count / resolved.resolved_market_count
+            if resolved.resolved_market_count > 0
+            else None
+        )
+        ranked_items.append(
+            {
+                "user_id": int(row["account"].user_id),
+                "external_user_ref": row["account"].external_user_ref,
+                "wallet_address": row["account"].wallet_address,
+                "preferred_username": row["account"].preferred_username,
+                "display_label": row["account"].display_label,
+                "platform_name": row["platform"].platform_name,
+                "resolved_market_count": int(resolved.resolved_market_count),
+                "winning_market_count": int(resolved.winning_market_count),
+                "realized_pnl": float(resolved.realized_pnl),
+                "realized_roi": float(resolved.realized_roi),
+                "win_rate": round(win_rate, 6) if win_rate is not None else None,
+                "trust_score": float(row["score"].trust_score or 0),
+                "profitability_score": float(row["score"].profitability_score or 0),
+                "is_whale": bool(row["score"].is_whale),
+                "is_trusted_whale": bool(row["score"].is_trusted_whale),
+                "whale_status": _score_whale_status(row["score"].is_whale, row["score"].is_trusted_whale),
+            }
+        )
+
+    ranked_items.sort(
+        key=lambda item: (
+            item["realized_pnl"],
+            item["realized_roi"],
+            item["win_rate"] if item["win_rate"] is not None else -1.0,
+            item["trust_score"],
+        ),
+        reverse=True,
+    )
+    items = ranked_items[:limit]
+    selected_user_ids = [int(item["user_id"]) for item in items]
+    latest_trade_by_user: dict[int, str | None] = {}
+    if selected_user_ids:
+        trade_window_clause = ""
+        trade_params: dict[str, Any] = {"user_ids": selected_user_ids}
+        if start_time is not None:
+            trade_window_clause = "AND tf.transaction_time >= :start_time"
+            trade_params["start_time"] = start_time
+        trade_rows = session.execute(
+            text(
+                f"""
+                SELECT
+                  tf.user_id,
+                  MAX(tf.transaction_time) AS latest_trade_time
+                FROM analytics.transaction_fact tf
+                WHERE tf.user_id = ANY(:user_ids)
+                  {trade_window_clause}
+                GROUP BY tf.user_id
+                """
+            ),
+            trade_params,
+        ).mappings().all()
+        latest_trade_by_user = {
+            int(row["user_id"]): row["latest_trade_time"].isoformat() if row["latest_trade_time"] else None
+            for row in trade_rows
+        }
+        for item in items:
+            user_id = int(item["user_id"])
+            score_row = score_by_user.get(user_id)
+            item["sample_trade_count"] = int(score_row["score"].sample_trade_count or 0) if score_row else 0
+            item["latest_trade_time"] = latest_trade_by_user.get(user_id)
+    return {
+        "scope": "polymarket_users",
+        "timeframe": timeframe,
+        "scoring_version": latest_batch.scoring_version,
+        "resolved_markets_observed": profitability_summary["resolved_markets_observed"],
+        "count": len(items),
+        "items": items,
+    }
+
+
+def market_whale_concentration(
+    session: Session,
+    limit: int = DEFAULT_LIMIT,
+    *,
+    timeframe: str = "all",
+) -> dict[str, Any] | None:
+    """Return the most whale-concentrated markets within a timeframe."""
+    cached_payload = latest_research_analytics_view(
+        session,
+        timeframe=timeframe,
+        view_name="market_whale_concentration",
+        limit=limit,
+    )
+    if cached_payload is not None:
+        return _apply_live_polymarket_market_rows_overlay(_with_current_whale_status(cached_payload))
+    return _apply_live_polymarket_market_rows_overlay(
+        _live_market_whale_concentration(session, limit=limit, timeframe=timeframe)
+    )
+
+
+def _live_market_whale_concentration(
+    session: Session,
+    limit: int = DEFAULT_LIMIT,
+    *,
+    timeframe: str = "all",
+) -> dict[str, Any] | None:
+    """Return market whale concentration using live transaction scans."""
+    latest_batch = _latest_whale_batch(session)
+    if latest_batch is None:
+        return None
+    start_time = timeframe_start(timeframe)
+    transaction_window_clause = ""
+    params: dict[str, Any] = {
+        "snapshot_time": latest_batch.snapshot_time,
+        "scoring_version": latest_batch.scoring_version,
+        "limit": limit,
+    }
+    if start_time is not None:
+        transaction_window_clause = "AND tf.transaction_time >= :start_time"
+        params["start_time"] = start_time
+
+    rows = session.execute(
+        text(
+            f"""
+            WITH latest_scores AS (
+              SELECT
+                w.user_id,
+                w.is_whale,
+                w.is_trusted_whale
+              FROM analytics.whale_score_snapshot w
+              WHERE w.snapshot_time = :snapshot_time
+                AND w.scoring_version = :scoring_version
+            )
+            SELECT
+              mc.market_contract_id,
+              mc.market_slug,
+              mc.market_url,
+              mc.question,
+              mc.is_closed,
+              mc.last_trade_price,
+              mc.volume,
+              p.platform_name,
+              COUNT(DISTINCT CASE WHEN ls.is_whale THEN tf.user_id END) AS whale_count,
+              COUNT(DISTINCT CASE WHEN ls.is_trusted_whale THEN tf.user_id END) AS trusted_whale_count,
+              MAX(tf.transaction_time) AS last_seen_trade_time,
+              MAX(CASE WHEN LOWER(COALESCE(tf.side, '')) = 'buy' THEN tf.transaction_time END) AS last_entry_time,
+              COALESCE(SUM(CASE
+                WHEN LOWER(COALESCE(tf.side, '')) = 'buy' AND LOWER(COALESCE(tf.outcome_label, '')) = 'yes'
+                THEN tf.notional_value
+                ELSE 0
+              END), 0) AS yes_buy_notional,
+              COALESCE(SUM(CASE
+                WHEN LOWER(COALESCE(tf.side, '')) = 'buy' AND LOWER(COALESCE(tf.outcome_label, '')) = 'no'
+                THEN tf.notional_value
+                ELSE 0
+              END), 0) AS no_buy_notional
+            FROM analytics.transaction_fact tf
+            JOIN latest_scores ls
+              ON ls.user_id = tf.user_id
+            JOIN analytics.market_contract mc
+              ON mc.market_contract_id = tf.market_contract_id
+            JOIN analytics.platform p
+              ON p.platform_id = mc.platform_id
+            WHERE (ls.is_whale = TRUE OR ls.is_trusted_whale = TRUE)
+              {transaction_window_clause}
+            GROUP BY
+              mc.market_contract_id,
+              mc.market_slug,
+              mc.market_url,
+              mc.question,
+              mc.is_closed,
+              mc.last_trade_price,
+              mc.volume,
+              p.platform_name
+            ORDER BY
+              trusted_whale_count DESC,
+              whale_count DESC,
+              mc.volume DESC NULLS LAST,
+              mc.market_contract_id ASC
+            LIMIT :limit
+            """
+        )
+        ,
+        params,
+    ).mappings().all()
+    items = [
+        {
+            "market_id": int(row["market_contract_id"]),
+            "market_contract_id": int(row["market_contract_id"]),
+            "platform_name": row["platform_name"],
+            "market_slug": row["market_slug"],
+            "market_url": row["market_url"],
+            "question": row["question"],
+            "price": float(row["last_trade_price"]) if row["last_trade_price"] is not None else None,
+            "volume": float(row["volume"]) if row["volume"] is not None else None,
+            "whale_count": int(row["whale_count"] or 0),
+            "trusted_whale_count": int(row["trusted_whale_count"] or 0),
+            "orderbook_depth": None,
+            "read_time": row["last_seen_trade_time"].isoformat() if row["last_seen_trade_time"] else None,
+            "last_entry_time": row["last_entry_time"].isoformat() if row["last_entry_time"] else None,
+            "market_status_label": _market_status_label(row["is_closed"]),
+            "whale_bias_label": _whale_bias_label(row["yes_buy_notional"], row["no_buy_notional"]),
+        }
+        for row in rows
+    ]
+    return {
+        "dashboard_id": None,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "scope": "cross_platform_markets",
+        "timeframe": timeframe,
+        "count": len(items),
+        "items": items,
+    }
+
+
+def recent_whale_entries(
+    session: Session,
+    limit: int = DEFAULT_LIMIT,
+    *,
+    timeframe: str = "all",
+) -> dict[str, Any] | None:
+    """Return the most recent whale buy-entry markets within a timeframe."""
+    cached_payload = latest_research_analytics_view(
+        session,
+        timeframe=timeframe,
+        view_name="recent_whale_entries",
+        limit=limit,
+    )
+    if cached_payload is not None:
+        return _apply_live_polymarket_market_rows_overlay(cached_payload)
+    return _apply_live_polymarket_market_rows_overlay(
+        _live_recent_whale_entries(session, limit=limit, timeframe=timeframe)
+    )
+
+
+def _live_recent_whale_entries(
+    session: Session,
+    limit: int = DEFAULT_LIMIT,
+    *,
+    timeframe: str = "all",
+) -> dict[str, Any] | None:
+    """Return recent whale entry markets using live transaction scans."""
+    latest_batch = _latest_whale_batch(session)
+    if latest_batch is None:
+        return None
+    start_time = timeframe_start(timeframe)
+    transaction_window_clause = ""
+    params: dict[str, Any] = {
+        "snapshot_time": latest_batch.snapshot_time,
+        "scoring_version": latest_batch.scoring_version,
+        "limit": limit,
+    }
+    if start_time is not None:
+        transaction_window_clause = "AND tf.transaction_time >= :start_time"
+        params["start_time"] = start_time
+
+    rows = session.execute(
+        text(
+            f"""
+            WITH latest_scores AS (
+              SELECT
+                w.user_id,
+                BOOL_OR(w.is_whale) AS is_whale,
+                BOOL_OR(w.is_trusted_whale) AS is_trusted_whale
+              FROM analytics.whale_score_snapshot w
+              WHERE w.snapshot_time = :snapshot_time
+                AND w.scoring_version = :scoring_version
+              GROUP BY w.user_id
+            )
+            SELECT
+              mc.market_contract_id,
+              mc.market_slug,
+              mc.market_url,
+              mc.question,
+              mc.is_closed,
+              mc.last_trade_price,
+              mc.volume,
+              p.platform_name,
+              COUNT(tf.transaction_id) AS entry_trade_count,
+              COUNT(DISTINCT CASE WHEN ls.is_whale THEN tf.user_id END) AS whale_count,
+              COUNT(DISTINCT CASE WHEN ls.is_trusted_whale THEN tf.user_id END) AS trusted_whale_count,
+              COALESCE(SUM(tf.notional_value), 0) AS total_entry_notional,
+              MAX(tf.transaction_time) AS latest_entry_time,
+              COALESCE(SUM(CASE
+                WHEN LOWER(COALESCE(tf.outcome_label, '')) = 'yes' THEN tf.notional_value
+                ELSE 0
+              END), 0) AS yes_entry_notional,
+              COALESCE(SUM(CASE
+                WHEN LOWER(COALESCE(tf.outcome_label, '')) = 'no' THEN tf.notional_value
+                ELSE 0
+              END), 0) AS no_entry_notional
+            FROM analytics.transaction_fact tf
+            JOIN latest_scores ls
+              ON ls.user_id = tf.user_id
+            JOIN analytics.market_contract mc
+              ON mc.market_contract_id = tf.market_contract_id
+            JOIN analytics.platform p
+              ON p.platform_id = mc.platform_id
+            WHERE LOWER(COALESCE(tf.side, '')) = 'buy'
+              AND (ls.is_whale = TRUE OR ls.is_trusted_whale = TRUE)
+              {transaction_window_clause}
+              AND mc.market_slug IS NOT NULL
+            GROUP BY
+              mc.market_contract_id,
+              mc.market_slug,
+              mc.market_url,
+              mc.question,
+              mc.is_closed,
+              mc.last_trade_price,
+              mc.volume,
+              p.platform_name
+            ORDER BY
+              latest_entry_time DESC NULLS LAST,
+              total_entry_notional DESC,
+              trusted_whale_count DESC,
+              whale_count DESC,
+              mc.market_contract_id ASC
+            LIMIT :limit
+            """
+        ),
+        params,
+    ).mappings().all()
+    items = [
+        {
+            "market_id": int(row["market_contract_id"]),
+            "market_contract_id": int(row["market_contract_id"]),
+            "platform_name": row["platform_name"],
+            "market_slug": row["market_slug"],
+            "market_url": row["market_url"],
+            "question": row["question"],
+            "price": float(row["last_trade_price"]) if row["last_trade_price"] is not None else None,
+            "volume": float(row["volume"]) if row["volume"] is not None else None,
+            "whale_count": int(row["whale_count"] or 0),
+            "trusted_whale_count": int(row["trusted_whale_count"] or 0),
+            "entry_trade_count": int(row["entry_trade_count"] or 0),
+            "total_entry_notional": float(row["total_entry_notional"] or 0),
+            "latest_entry_time": row["latest_entry_time"].isoformat() if row["latest_entry_time"] else None,
+            "market_status_label": _market_status_label(row["is_closed"]),
+            "whale_bias_label": _whale_bias_label(row["yes_entry_notional"], row["no_entry_notional"]),
+        }
+        for row in rows
+    ]
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "scope": "recent_whale_entries",
+        "timeframe": timeframe,
+        "count": len(items),
+        "items": items,
+    }
+
+
+def whale_entry_behavior(
+    session: Session,
+    limit: int = DEFAULT_LIMIT,
+    *,
+    timeframe: str = "all",
+) -> dict[str, Any] | None:
+    """Return entry-price behavior for whale-labelled Polymarket users."""
+    cached_payload = latest_research_analytics_view(
+        session,
+        timeframe=timeframe,
+        view_name="whale_entry_behavior",
+        limit=limit,
+    )
+    if cached_payload is not None:
+        return _with_current_whale_status(cached_payload)
+    return _live_whale_entry_behavior(session, limit=limit, timeframe=timeframe)
+
+
+def _live_whale_entry_behavior(
+    session: Session,
+    limit: int = DEFAULT_LIMIT,
+    *,
+    timeframe: str = "all",
+) -> dict[str, Any] | None:
+    """Return whale entry behavior using live transaction scans."""
+    latest_batch = _latest_whale_batch(session)
+    if latest_batch is None:
+        return None
+    start_time = timeframe_start(timeframe)
+    transaction_window_clause = ""
+    params: dict[str, Any] = {
+        "snapshot_time": latest_batch.snapshot_time,
+        "scoring_version": latest_batch.scoring_version,
+        "limit": limit,
+    }
+    if start_time is not None:
+        transaction_window_clause = "AND tf.transaction_time >= :start_time"
+        params["start_time"] = start_time
+
+    rows = session.execute(
+        text(
+            f"""
+            WITH latest_scores AS (
+              SELECT
+                w.user_id,
+                w.trust_score,
+                w.profitability_score,
+                w.is_whale,
+                w.is_trusted_whale,
+                (w.is_whale OR w.is_trusted_whale) AS whale_status
+              FROM analytics.whale_score_snapshot w
+              JOIN analytics.platform p
+                ON p.platform_id = w.platform_id
+              WHERE w.snapshot_time = :snapshot_time
+                AND w.scoring_version = :scoring_version
+                AND p.platform_name = 'polymarket'
+                AND (w.is_whale = TRUE OR w.is_trusted_whale = TRUE)
+            )
+            SELECT
+              ua.user_id,
+              ua.external_user_ref,
+              ua.wallet_address,
+              ua.preferred_username,
+              ua.display_label,
+              ls.trust_score,
+              ls.profitability_score,
+              ls.is_whale,
+              ls.is_trusted_whale,
+              ls.whale_status,
+              COUNT(tf.transaction_id) AS entry_trade_count,
+              COUNT(DISTINCT tf.market_contract_id) AS distinct_markets,
+              COALESCE(SUM(tf.shares), 0) AS total_entry_shares,
+              COALESCE(SUM(tf.notional_value), 0) AS total_entry_notional,
+              COALESCE(SUM(tf.notional_value) / NULLIF(SUM(tf.shares), 0), 0) AS weighted_avg_entry_price,
+              SUM(CASE WHEN mc.last_trade_price IS NOT NULL THEN tf.shares * mc.last_trade_price ELSE 0 END)
+                / NULLIF(SUM(CASE WHEN mc.last_trade_price IS NOT NULL THEN tf.shares ELSE 0 END), 0) AS weighted_current_price,
+              COALESCE(AVG(tf.shares), 0) AS avg_entry_shares,
+              COALESCE(MIN(tf.price), 0) AS min_entry_price,
+              COALESCE(MAX(tf.price), 0) AS max_entry_price,
+              COUNT(tf.transaction_id) FILTER (WHERE LOWER(COALESCE(tf.outcome_label, '')) = 'yes') AS yes_entry_trade_count,
+              COUNT(tf.transaction_id) FILTER (WHERE LOWER(COALESCE(tf.outcome_label, '')) = 'no') AS no_entry_trade_count,
+              MAX(tf.transaction_time) AS last_entry_time
+            FROM analytics.transaction_fact tf
+            JOIN latest_scores ls
+              ON ls.user_id = tf.user_id
+            JOIN analytics.user_account ua
+              ON ua.user_id = tf.user_id
+            JOIN analytics.market_contract mc
+              ON mc.market_contract_id = tf.market_contract_id
+            WHERE tf.side = 'buy'
+              AND tf.price IS NOT NULL
+              AND tf.shares IS NOT NULL
+              {transaction_window_clause}
+            GROUP BY
+              ua.user_id,
+              ua.external_user_ref,
+              ua.wallet_address,
+              ua.preferred_username,
+              ua.display_label,
+              ls.trust_score,
+              ls.profitability_score,
+              ls.is_whale,
+              ls.is_trusted_whale,
+              ls.whale_status
+            ORDER BY
+              entry_trade_count DESC,
+              distinct_markets DESC,
+              ls.trust_score DESC,
+              ua.user_id ASC
+            LIMIT :limit
+            """
+        ),
+        params,
+    ).mappings().all()
+    items = [
+        {
+            "user_id": int(row["user_id"]),
+            "external_user_ref": row["external_user_ref"],
+            "wallet_address": row["wallet_address"],
+            "preferred_username": row["preferred_username"],
+            "display_label": row["display_label"],
+            "trust_score": float(row["trust_score"] or 0),
+            "profitability_score": float(row["profitability_score"] or 0),
+            "is_whale": bool(row["is_whale"]),
+            "is_trusted_whale": bool(row["is_trusted_whale"]),
+            "whale_status": bool(row["whale_status"]),
+            "entry_trade_count": int(row["entry_trade_count"] or 0),
+            "distinct_markets": int(row["distinct_markets"] or 0),
+            "total_entry_shares": float(row["total_entry_shares"] or 0),
+            "total_entry_notional": float(row["total_entry_notional"] or 0),
+            "weighted_avg_entry_price": float(row["weighted_avg_entry_price"] or 0),
+            "weighted_current_price": float(row["weighted_current_price"]) if row["weighted_current_price"] is not None else None,
+            "avg_entry_shares": float(row["avg_entry_shares"] or 0),
+            "min_entry_price": float(row["min_entry_price"] or 0),
+            "max_entry_price": float(row["max_entry_price"] or 0),
+            "yes_entry_trade_count": int(row["yes_entry_trade_count"] or 0),
+            "no_entry_trade_count": int(row["no_entry_trade_count"] or 0),
+            "last_entry_time": row["last_entry_time"].isoformat() if row["last_entry_time"] else None,
+            "entry_edge": (
+                round(float(row["weighted_current_price"]) - float(row["weighted_avg_entry_price"]), 6)
+                if row["weighted_current_price"] is not None and row["weighted_avg_entry_price"] is not None
+                else None
+            ),
+        }
+        for row in rows
+    ]
+    return {
+        "scope": "polymarket_whales",
+        "timeframe": timeframe,
+        "scoring_version": latest_batch.scoring_version,
+        "count": len(items),
+        "items": items,
+    }
+
+
+def user_activity_insights(
+    session: Session,
+    user_id: int,
+    *,
+    timeframe: str = "all",
+) -> dict[str, Any] | None:
+    """Return user-level activity insights for the selected timeframe."""
+    user = session.get(UserAccount, user_id)
+    if user is None:
+        return None
+
+    start_time = timeframe_start(timeframe)
+    transaction_window_clause = ""
+    params: dict[str, Any] = {"user_id": user_id}
+    if start_time is not None:
+        transaction_window_clause = "AND tf.transaction_time >= :start_time"
+        params["start_time"] = start_time
+
+    summary_row = session.execute(
+        text(
+            f"""
+            SELECT
+              COUNT(tf.transaction_id) AS trade_count,
+              COUNT(DISTINCT tf.market_contract_id) AS distinct_markets,
+              COUNT(DISTINCT DATE(tf.transaction_time AT TIME ZONE 'UTC')) AS active_days,
+              COALESCE(SUM(tf.notional_value), 0) AS total_notional,
+              MAX(tf.transaction_time) AS latest_trade_time
+            FROM analytics.transaction_fact tf
+            WHERE tf.user_id = :user_id
+              {transaction_window_clause}
+            """
+        ),
+        params,
+    ).mappings().one()
+
+    tag_rows = session.execute(
+        text(
+            f"""
+            WITH filtered_tx AS (
+              SELECT
+                tf.transaction_id,
+                tf.event_id,
+                COALESCE(tf.notional_value, 0) AS notional_value,
+                LOWER(CONCAT_WS(
+                  ' ',
+                  me.title,
+                  me.slug,
+                  me.category,
+                  mc.question,
+                  mc.market_slug,
+                  mc.outcome_a_label,
+                  mc.outcome_b_label
+                )) AS haystack
+              FROM analytics.transaction_fact tf
+              JOIN analytics.market_contract mc
+                ON mc.market_contract_id = tf.market_contract_id
+              JOIN analytics.market_event me
+                ON me.event_id = mc.event_id
+              WHERE tf.user_id = :user_id
+                {transaction_window_clause}
+            ),
+            classified_tx AS (
+              SELECT
+                transaction_id,
+                notional_value,
+                CASE
+                  WHEN haystack ~ '(video[ -]?games?|videogames?|gaming|gta|grand theft auto|nintendo|playstation|xbox|steam|esports?|counter[ -]?strike|cs2|fortnite|call of duty|rockstar|rocket league|league of legends|valorant|dota)'
+                    THEN 'Video Game'
+                  WHEN haystack ~ '(crypto|cryptocurrenc|bitcoin|ethereum|solana|doge|dogecoin|xrp|btc|eth|token|airdrop|coinbase|kraken|stablecoin|microstrategy|mstr|blockchain|defi)'
+                    THEN 'Crypto'
+                  WHEN haystack ~ '(finance|financial|stocks?|stock market|equities|shares|earnings|revenue|eps|guidance|market cap|fed|federal reserve|interest rates?|rate cuts?|rate hikes?|inflation|\\bcpi\\b|\\bppi\\b|recession|\\bgdp\\b|unemployment|jobs report|payrolls|commodit|\\boil\\b|\\bgold\\b|\\bsilver\\b|\\betfs?\\b|banks?|jpmorgan|goldman|ipo|merger|acquisition|buyout|s&p[ -]?500|sp500|nasdaq|dow jones|treasur|bonds?|yields?|mortgage rates?)'
+                    THEN 'Finance'
+                  WHEN haystack ~ '(technology|tech|openai|gpt|llm|artificial intelligence|\\bai\\b|nvidia|amd|microsoft|google|alphabet|meta|apple|anthropic|sam altman|semiconductor|chips?|software|hardware)'
+                    THEN 'Technology'
+                  WHEN haystack ~ '(geopolit|world affairs|foreign policy|diplom|ceasefire|military|nato|ukraine|russia|putin|zelensky|china|taiwan|iran|israel|gaza|syria|middle east|\\bwar\\b)'
+                    THEN 'Geopolitics'
+                  WHEN haystack ~ '(politic|elections?|government|president|presidential|prime minister|congress|senate|parliament|cabinet|minister|tariff|trump|biden|starmer|macron|supreme court|us government)'
+                    THEN 'Politics'
+                  ELSE 'Other'
+                END AS category_name
+              FROM filtered_tx
+            ),
+            category_totals AS (
+              SELECT
+                category_name,
+                COALESCE(SUM(notional_value), 0) AS total_notional,
+                COUNT(transaction_id) AS trade_count
+              FROM classified_tx
+              GROUP BY category_name
+            )
+            SELECT
+              category_name,
+              total_notional,
+              trade_count
+            FROM category_totals
+            ORDER BY
+              CASE category_name
+                WHEN 'Video Game' THEN 1
+                WHEN 'Technology' THEN 2
+                WHEN 'Crypto' THEN 3
+                WHEN 'Finance' THEN 4
+                WHEN 'Geopolitics' THEN 5
+                WHEN 'Politics' THEN 6
+                ELSE 7
+              END,
+              total_notional DESC
+            """
+        ),
+        params,
+    ).mappings().all()
+    total_category_trades = sum(int(row["trade_count"] or 0) for row in tag_rows)
+    tag_exposure = [
+        {
+            "label": row["category_name"],
+            "total_notional": float(row["total_notional"] or 0),
+            "trade_count": int(row["trade_count"] or 0),
+            "percentage": (
+                round(int(row["trade_count"] or 0) / total_category_trades, 6)
+                if total_category_trades > 0
+                else 0.0
+            ),
+        }
+        for row in tag_rows
+    ]
+    if total_category_trades > 0 and not any(item["label"] == "Other" for item in tag_exposure):
+        tag_exposure.append(
+            {
+                "label": "Other",
+                "total_notional": 0.0,
+                "trade_count": 0,
+                "percentage": 0.0,
+            }
+        )
+    tag_exposure.sort(
+        key=lambda item: {
+            "Video Game": 1,
+            "Technology": 2,
+            "Crypto": 3,
+            "Finance": 4,
+            "Geopolitics": 5,
+            "Politics": 6,
+            "Other": 7,
+        }.get(str(item["label"]), 99)
+    )
+    tag_exposure = [item for item in tag_exposure if item["trade_count"] > 0]
+
+    outcome_rows = session.execute(
+        text(
+            f"""
+            SELECT
+              CASE
+                WHEN LOWER(COALESCE(tf.outcome_label, '')) = 'yes' THEN 'yes'
+                WHEN LOWER(COALESCE(tf.outcome_label, '')) = 'no' THEN 'no'
+                ELSE 'other'
+              END AS outcome_label,
+              COUNT(tf.transaction_id) AS trade_count,
+              COALESCE(SUM(tf.notional_value), 0) AS total_notional
+            FROM analytics.transaction_fact tf
+            WHERE tf.user_id = :user_id
+              {transaction_window_clause}
+            GROUP BY 1
+            """
+        ),
+        params,
+    ).mappings().all()
+    outcome_map = {
+        "yes": {"label": "yes", "trade_count": 0, "total_notional": 0.0},
+        "no": {"label": "no", "trade_count": 0, "total_notional": 0.0},
+        "other": {"label": "other", "trade_count": 0, "total_notional": 0.0},
+    }
+    for row in outcome_rows:
+        bucket = outcome_map[str(row["outcome_label"])]
+        bucket["trade_count"] = int(row["trade_count"] or 0)
+        bucket["total_notional"] = float(row["total_notional"] or 0)
+    total_outcome_trades = sum(item["trade_count"] for item in outcome_map.values())
+    outcome_bias = []
+    for label in ("yes", "no", "other"):
+        bucket = outcome_map[label]
+        outcome_bias.append(
+            {
+                **bucket,
+                "percentage": (
+                    round(bucket["trade_count"] / total_outcome_trades, 6)
+                    if total_outcome_trades > 0
+                    else 0.0
+                ),
+            }
+        )
+
+    hourly_rows = session.execute(
+        text(
+            f"""
+            SELECT
+              EXTRACT(HOUR FROM tf.transaction_time AT TIME ZONE 'UTC')::integer AS hour_utc,
+              COUNT(tf.transaction_id) AS trade_count,
+              COALESCE(SUM(tf.notional_value), 0) AS total_notional
+            FROM analytics.transaction_fact tf
+            WHERE tf.user_id = :user_id
+              AND tf.transaction_time IS NOT NULL
+              {transaction_window_clause}
+            GROUP BY 1
+            ORDER BY 1 ASC
+            """
+        ),
+        params,
+    ).mappings().all()
+    hourly_map = {
+        int(row["hour_utc"]): {
+            "hour_utc": int(row["hour_utc"]),
+            "trade_count": int(row["trade_count"] or 0),
+            "total_notional": float(row["total_notional"] or 0),
+        }
+        for row in hourly_rows
+    }
+    hourly_activity_utc = [
+        hourly_map.get(hour, {"hour_utc": hour, "trade_count": 0, "total_notional": 0.0})
+        for hour in range(24)
+    ]
+
+    recent_trade_rows = session.execute(
+        text(
+            f"""
+            SELECT
+              tf.transaction_id,
+              tf.transaction_time,
+              tf.transaction_type,
+              tf.market_contract_id,
+              mc.market_slug,
+              mc.question,
+              tf.outcome_label,
+              tf.price,
+              tf.shares,
+              tf.notional_value
+            FROM analytics.transaction_fact tf
+            JOIN analytics.market_contract mc
+              ON mc.market_contract_id = tf.market_contract_id
+            WHERE tf.user_id = :user_id
+              {transaction_window_clause}
+            ORDER BY tf.transaction_time DESC NULLS LAST, tf.transaction_id DESC
+            LIMIT :recent_limit
+            """
+        ),
+        {
+            **params,
+            "recent_limit": USER_ACTIVITY_RECENT_TRADE_LIMIT,
+        },
+    ).mappings().all()
+    recent_trades = [
+        {
+            "transaction_id": int(row["transaction_id"]),
+            "transaction_time": row["transaction_time"].isoformat() if row["transaction_time"] else None,
+            "transaction_type": row["transaction_type"],
+            "market_contract_id": int(row["market_contract_id"]),
+            "market_slug": row["market_slug"],
+            "question": row["question"],
+            "outcome_label": row["outcome_label"],
+            "price": float(row["price"]) if row["price"] is not None else None,
+            "shares": float(row["shares"]) if row["shares"] is not None else None,
+            "notional_value": float(row["notional_value"]) if row["notional_value"] is not None else None,
+        }
+        for row in recent_trade_rows
+    ]
+
+    current_position_rows = session.execute(
+        text(
+            """
+            WITH ranked_positions AS (
+              SELECT
+                ps.position_snapshot_id,
+                ps.market_contract_id,
+                ps.snapshot_time,
+                ps.position_size,
+                ps.avg_entry_price,
+                ps.current_mark_price,
+                ps.market_value,
+                ps.cash_pnl,
+                ps.realized_pnl,
+                ps.unrealized_pnl,
+                ps.is_redeemable,
+                ps.is_mergeable,
+                ROW_NUMBER() OVER (
+                  PARTITION BY ps.market_contract_id
+                  ORDER BY ps.snapshot_time DESC, ps.position_snapshot_id DESC
+                ) AS row_num
+              FROM analytics.position_snapshot ps
+              WHERE ps.user_id = :user_id
+            )
+            SELECT
+              rp.position_snapshot_id,
+              rp.market_contract_id,
+              mc.market_slug,
+              mc.question,
+              rp.snapshot_time,
+              rp.position_size,
+              rp.avg_entry_price,
+              rp.current_mark_price,
+              rp.market_value,
+              rp.cash_pnl,
+              rp.realized_pnl,
+              rp.unrealized_pnl,
+              rp.is_redeemable,
+              rp.is_mergeable
+            FROM ranked_positions rp
+            JOIN analytics.market_contract mc
+              ON mc.market_contract_id = rp.market_contract_id
+            WHERE rp.row_num = 1
+            ORDER BY ABS(COALESCE(rp.market_value, 0)) DESC,
+                     rp.snapshot_time DESC NULLS LAST,
+                     rp.position_snapshot_id DESC
+            """
+        ),
+        {"user_id": user_id},
+    ).mappings().all()
+    current_positions = [
+        {
+            "position_snapshot_id": int(row["position_snapshot_id"]),
+            "market_contract_id": int(row["market_contract_id"]),
+            "market_slug": row["market_slug"],
+            "question": row["question"],
+            "snapshot_time": row["snapshot_time"].isoformat() if row["snapshot_time"] else None,
+            "position_size": float(row["position_size"]) if row["position_size"] is not None else None,
+            "avg_entry_price": float(row["avg_entry_price"]) if row["avg_entry_price"] is not None else None,
+            "current_mark_price": float(row["current_mark_price"]) if row["current_mark_price"] is not None else None,
+            "market_value": float(row["market_value"]) if row["market_value"] is not None else None,
+            "cash_pnl": float(row["cash_pnl"]) if row["cash_pnl"] is not None else None,
+            "realized_pnl": float(row["realized_pnl"]) if row["realized_pnl"] is not None else None,
+            "unrealized_pnl": float(row["unrealized_pnl"]) if row["unrealized_pnl"] is not None else None,
+            "is_redeemable": bool(row["is_redeemable"]),
+            "is_mergeable": bool(row["is_mergeable"]),
+        }
+        for row in current_position_rows
+    ]
+
+    return {
+        "user_id": user.user_id,
+        "timeframe": timeframe,
+        "summary": {
+            "trade_count": int(summary_row["trade_count"] or 0),
+            "distinct_markets": int(summary_row["distinct_markets"] or 0),
+            "active_days": int(summary_row["active_days"] or 0),
+            "total_notional": float(summary_row["total_notional"] or 0),
+            "latest_trade_time": (
+                summary_row["latest_trade_time"].isoformat()
+                if summary_row["latest_trade_time"]
+                else None
+            ),
+        },
+        "tag_exposure": tag_exposure,
+        "outcome_bias": outcome_bias,
+        "hourly_activity_utc": hourly_activity_utc,
+        "recent_trades": recent_trades,
+        "current_positions": current_positions,
+    }
+
+
+def following_overview(
+    session: Session,
+    *,
+    user_ids: list[int] | None = None,
+    market_slugs: list[str] | None = None,
+) -> dict[str, Any]:
+    """Return combined watchlist analytics for the Following page."""
+    normalized_user_ids = _normalize_watchlist_user_ids(user_ids)
+    normalized_market_slugs = _normalize_watchlist_market_slugs(market_slugs)
+    watchlist_summary = {
+        "followed_trader_count": len(normalized_user_ids),
+        "followed_market_count": len(normalized_market_slugs),
+        "active_followed_traders_24h": 0,
+        "markets_entered_24h": 0,
+        "recent_closed_followed_market_count": 0,
+    }
+    inflow_24h: list[dict[str, Any]] = []
+    market_focus_recent: list[dict[str, Any]] = []
+    recent_closed_markets: list[dict[str, Any]] = []
+    trader_focus: list[dict[str, Any]] = []
+
+    if normalized_user_ids:
+        now_utc = datetime.now(timezone.utc)
+        last_24_hours = now_utc - timedelta(hours=24)
+        last_30_days = now_utc - timedelta(days=30)
+
+        user_accounts = {
+            row.user_id: row
+            for row in session.scalars(
+                select(UserAccount).where(UserAccount.user_id.in_(normalized_user_ids))
+            ).all()
+        }
+
+        summary_row = session.execute(
+            text(
+                """
+                SELECT
+                  COUNT(DISTINCT tf.user_id) AS active_followed_traders_24h,
+                  COUNT(DISTINCT CASE WHEN LOWER(COALESCE(tf.side, '')) = 'buy' THEN tf.market_contract_id END) AS markets_entered_24h
+                FROM analytics.transaction_fact tf
+                WHERE tf.user_id = ANY(:user_ids)
+                  AND tf.transaction_time >= :window_start
+                """
+            ),
+            {
+                "user_ids": normalized_user_ids,
+                "window_start": last_24_hours,
+            },
+        ).mappings().one()
+        watchlist_summary["active_followed_traders_24h"] = int(summary_row["active_followed_traders_24h"] or 0)
+        watchlist_summary["markets_entered_24h"] = int(summary_row["markets_entered_24h"] or 0)
+
+        inflow_rows = session.execute(
+            text(
+                """
+                SELECT
+                  mc.market_slug,
+                  mc.question,
+                  mc.is_closed,
+                  COUNT(DISTINCT tf.user_id) AS distinct_trader_count,
+                  COALESCE(SUM(tf.notional_value), 0) AS total_notional,
+                  COALESCE(SUM(tf.shares), 0) AS total_shares,
+                  MAX(tf.transaction_time) AS latest_trade_time
+                FROM analytics.transaction_fact tf
+                JOIN analytics.market_contract mc
+                  ON mc.market_contract_id = tf.market_contract_id
+                WHERE tf.user_id = ANY(:user_ids)
+                  AND tf.transaction_time >= :window_start
+                  AND LOWER(COALESCE(tf.side, '')) = 'buy'
+                  AND mc.market_slug IS NOT NULL
+                GROUP BY mc.market_contract_id, mc.market_slug, mc.question, mc.is_closed
+                ORDER BY total_notional DESC,
+                         latest_trade_time DESC NULLS LAST,
+                         mc.market_slug ASC
+                LIMIT 5
+                """
+            ),
+            {
+                "user_ids": normalized_user_ids,
+                "window_start": last_24_hours,
+            },
+        ).mappings().all()
+        inflow_24h = [
+            {
+                "market_slug": row["market_slug"],
+                "question": row["question"],
+                "distinct_trader_count": int(row["distinct_trader_count"] or 0),
+                "total_notional": float(row["total_notional"] or 0),
+                "total_shares": float(row["total_shares"] or 0),
+                "latest_trade_time": row["latest_trade_time"].isoformat() if row["latest_trade_time"] else None,
+                "market_status_label": _market_status_label(row["is_closed"]),
+            }
+            for row in inflow_rows
+        ]
+
+        position_focus_rows = session.execute(
+            text(
+                f"""
+                WITH latest_positions AS (
+                  SELECT
+                    ps.user_id,
+                    ps.market_contract_id,
+                    mc.market_slug,
+                    mc.question,
+                    {MARKET_CATEGORY_SQL} AS market_category,
+                    mc.is_closed,
+                    ABS(COALESCE(ps.market_value, 0)) AS focus_value,
+                    ps.snapshot_time AS latest_activity_time,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY ps.user_id, ps.market_contract_id
+                      ORDER BY ps.snapshot_time DESC, ps.position_snapshot_id DESC
+                    ) AS market_row_num
+                  FROM analytics.position_snapshot ps
+                  JOIN analytics.market_contract mc
+                    ON mc.market_contract_id = ps.market_contract_id
+                  JOIN analytics.market_event me
+                    ON me.event_id = mc.event_id
+                  WHERE ps.user_id = ANY(:user_ids)
+                    AND mc.market_slug IS NOT NULL
+                ),
+                ranked_focus AS (
+                  SELECT
+                    lp.*,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY lp.user_id
+                      ORDER BY lp.focus_value DESC,
+                               lp.latest_activity_time DESC NULLS LAST,
+                               lp.market_contract_id DESC
+                    ) AS user_row_num
+                  FROM latest_positions lp
+                  WHERE lp.market_row_num = 1
+                    AND lp.focus_value > 0
+                )
+                SELECT
+                  user_id,
+                  market_slug,
+                  question,
+                  market_category,
+                  is_closed,
+                  focus_value,
+                  latest_activity_time
+                FROM ranked_focus
+                WHERE user_row_num = 1
+                """
+            ),
+            {"user_ids": normalized_user_ids},
+        ).mappings().all()
+
+        trader_focus_by_user: dict[int, dict[str, Any]] = {}
+        for row in position_focus_rows:
+            user_id = int(row["user_id"])
+            account = user_accounts.get(user_id)
+            if account is None:
+                continue
+            trader_focus_by_user[user_id] = {
+                "user_id": user_id,
+                "external_user_ref": account.external_user_ref,
+                "wallet_address": account.wallet_address,
+                "preferred_username": account.preferred_username,
+                "display_label": account.display_label,
+                "main_market_slug": row["market_slug"],
+                "main_market_question": row["question"],
+                "focus_value": float(row["focus_value"] or 0),
+                "focus_source": "position",
+                "main_market_category": row["market_category"],
+                "latest_activity_time": row["latest_activity_time"],
+                "market_status_label": _market_status_label(row["is_closed"]),
+            }
+
+        missing_user_ids = [user_id for user_id in normalized_user_ids if user_id not in trader_focus_by_user]
+        if missing_user_ids:
+            recent_flow_rows = session.execute(
+                text(
+                    f"""
+                    WITH recent_market_flow AS (
+                      SELECT
+                        tf.user_id,
+                        tf.market_contract_id,
+                        mc.market_slug,
+                        mc.question,
+                        {MARKET_CATEGORY_SQL} AS market_category,
+                        mc.is_closed,
+                        COALESCE(SUM(tf.notional_value), 0) AS focus_value,
+                        MAX(tf.transaction_time) AS latest_activity_time
+                      FROM analytics.transaction_fact tf
+                      JOIN analytics.market_contract mc
+                        ON mc.market_contract_id = tf.market_contract_id
+                      JOIN analytics.market_event me
+                        ON me.event_id = mc.event_id
+                      WHERE tf.user_id = ANY(:user_ids)
+                        AND tf.transaction_time >= :window_start
+                        AND LOWER(COALESCE(tf.side, '')) = 'buy'
+                        AND mc.market_slug IS NOT NULL
+                      GROUP BY tf.user_id, tf.market_contract_id, mc.market_slug, mc.question, mc.is_closed, {MARKET_CATEGORY_SQL}
+                    ),
+                    ranked_recent_flow AS (
+                      SELECT
+                        rmf.*,
+                        ROW_NUMBER() OVER (
+                          PARTITION BY rmf.user_id
+                          ORDER BY rmf.focus_value DESC,
+                                   rmf.latest_activity_time DESC NULLS LAST,
+                                   rmf.market_contract_id DESC
+                        ) AS user_row_num
+                      FROM recent_market_flow rmf
+                      WHERE rmf.focus_value > 0
+                    )
+                    SELECT
+                      user_id,
+                      market_slug,
+                      question,
+                      market_category,
+                      is_closed,
+                      focus_value,
+                      latest_activity_time
+                    FROM ranked_recent_flow
+                    WHERE user_row_num = 1
+                    """
+                ),
+                {
+                    "user_ids": missing_user_ids,
+                    "window_start": last_30_days,
+                },
+            ).mappings().all()
+            for row in recent_flow_rows:
+                user_id = int(row["user_id"])
+                account = user_accounts.get(user_id)
+                if account is None:
+                    continue
+                trader_focus_by_user[user_id] = {
+                    "user_id": user_id,
+                    "external_user_ref": account.external_user_ref,
+                    "wallet_address": account.wallet_address,
+                    "preferred_username": account.preferred_username,
+                    "display_label": account.display_label,
+                    "main_market_slug": row["market_slug"],
+                    "main_market_question": row["question"],
+                    "focus_value": float(row["focus_value"] or 0),
+                    "focus_source": "recent_flow",
+                    "main_market_category": row["market_category"],
+                    "latest_activity_time": row["latest_activity_time"],
+                    "market_status_label": _market_status_label(row["is_closed"]),
+                }
+
+        missing_user_ids = [user_id for user_id in normalized_user_ids if user_id not in trader_focus_by_user]
+        if missing_user_ids:
+            lifetime_flow_rows = session.execute(
+                text(
+                    f"""
+                    WITH lifetime_market_flow AS (
+                      SELECT
+                        tf.user_id,
+                        tf.market_contract_id,
+                        mc.market_slug,
+                        mc.question,
+                        {MARKET_CATEGORY_SQL} AS market_category,
+                        mc.is_closed,
+                        COALESCE(SUM(CASE WHEN LOWER(COALESCE(tf.side, '')) = 'buy' THEN tf.notional_value ELSE 0 END), 0) AS buy_focus_value,
+                        COALESCE(SUM(tf.notional_value), 0) AS total_notional,
+                        MAX(tf.transaction_time) AS latest_activity_time
+                      FROM analytics.transaction_fact tf
+                      JOIN analytics.market_contract mc
+                        ON mc.market_contract_id = tf.market_contract_id
+                      JOIN analytics.market_event me
+                        ON me.event_id = mc.event_id
+                      WHERE tf.user_id = ANY(:user_ids)
+                        AND mc.market_slug IS NOT NULL
+                      GROUP BY tf.user_id, tf.market_contract_id, mc.market_slug, mc.question, mc.is_closed, {MARKET_CATEGORY_SQL}
+                    ),
+                    ranked_lifetime_flow AS (
+                      SELECT
+                        lmf.*,
+                        ROW_NUMBER() OVER (
+                          PARTITION BY lmf.user_id
+                          ORDER BY lmf.buy_focus_value DESC,
+                                   lmf.total_notional DESC,
+                                   lmf.latest_activity_time DESC NULLS LAST,
+                                   lmf.market_contract_id DESC
+                        ) AS user_row_num
+                      FROM lifetime_market_flow lmf
+                      WHERE lmf.buy_focus_value > 0
+                    )
+                    SELECT
+                      user_id,
+                      market_slug,
+                      question,
+                      market_category,
+                      is_closed,
+                      buy_focus_value AS focus_value,
+                      latest_activity_time
+                    FROM ranked_lifetime_flow
+                    WHERE user_row_num = 1
+                    """
+                ),
+                {"user_ids": missing_user_ids},
+            ).mappings().all()
+            for row in lifetime_flow_rows:
+                user_id = int(row["user_id"])
+                account = user_accounts.get(user_id)
+                if account is None:
+                    continue
+                trader_focus_by_user[user_id] = {
+                    "user_id": user_id,
+                    "external_user_ref": account.external_user_ref,
+                    "wallet_address": account.wallet_address,
+                    "preferred_username": account.preferred_username,
+                    "display_label": account.display_label,
+                    "main_market_slug": row["market_slug"],
+                    "main_market_question": row["question"],
+                    "focus_value": float(row["focus_value"] or 0),
+                    "focus_source": "lifetime_flow",
+                    "main_market_category": row["market_category"],
+                    "latest_activity_time": row["latest_activity_time"],
+                    "market_status_label": _market_status_label(row["is_closed"]),
+                }
+
+        focus_total = sum(float(item["focus_value"] or 0) for item in trader_focus_by_user.values())
+        trader_focus_items = []
+        live_market_cache: dict[str, LivePolymarketMarket | None] = {}
+        for user_id in normalized_user_ids:
+            item = trader_focus_by_user.get(user_id)
+            if item is None:
+                continue
+            latest_activity_time = item["latest_activity_time"]
+            focus_item = _apply_live_polymarket_following_focus_overlay(
+                {
+                    **item,
+                    "share_percentage": (
+                        round(float(item["focus_value"] or 0) / focus_total, 6)
+                        if focus_total > 0
+                        else 0.0
+                    ),
+                    "latest_activity_time": latest_activity_time.isoformat() if latest_activity_time else None,
+                },
+                live_market_cache=live_market_cache,
+                slug_key="main_market_slug",
+            )
+            trader_focus_items.append(focus_item)
+        trader_focus = trader_focus_items
+
+        aggregated_focus: dict[str, dict[str, Any]] = {}
+        for item in trader_focus_items:
+            market_slug = item["main_market_slug"]
+            current = aggregated_focus.get(market_slug)
+            latest_activity_time = item["latest_activity_time"]
+            if current is None:
+                aggregated_focus[market_slug] = {
+                    "market_slug": market_slug,
+                    "question": item["main_market_question"],
+                    "trader_count": 1,
+                    "total_focus_value": float(item["focus_value"] or 0),
+                    "latest_activity_time": latest_activity_time,
+                    "market_status_label": item["market_status_label"],
+                }
+                continue
+            current["trader_count"] += 1
+            current["total_focus_value"] += float(item["focus_value"] or 0)
+            if (
+                isinstance(latest_activity_time, str)
+                and (
+                    current["latest_activity_time"] is None
+                    or str(current["latest_activity_time"]) < latest_activity_time
+                )
+            ):
+                current["latest_activity_time"] = latest_activity_time
+
+        market_focus_recent = sorted(
+            aggregated_focus.values(),
+            key=lambda item: (
+                item["latest_activity_time"] or "",
+                item["total_focus_value"],
+                item["trader_count"],
+            ),
+            reverse=True,
+        )[:5]
+
+    if normalized_market_slugs:
+        recent_closed_count = int(
+            session.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM analytics.market_contract mc
+                    JOIN analytics.market_event me
+                      ON me.event_id = mc.event_id
+                    WHERE LOWER(COALESCE(mc.market_slug, '')) = ANY(:market_slugs)
+                      AND (
+                        mc.is_closed = TRUE
+                        OR me.closed_time IS NOT NULL
+                        OR (mc.end_time IS NOT NULL AND mc.end_time <= NOW())
+                      )
+                    """
+                ),
+                {"market_slugs": normalized_market_slugs},
+            ).scalar_one()
+        )
+        watchlist_summary["recent_closed_followed_market_count"] = recent_closed_count
+
+        closed_market_rows = session.execute(
+            text(
+                """
+                SELECT
+                  mc.market_contract_id,
+                  mc.market_slug,
+                  mc.question,
+                  mc.condition_ref,
+                  mc.outcome_a_label,
+                  mc.outcome_b_label,
+                  COALESCE(me.closed_time, mc.end_time, mc.updated_at) AS closed_time
+                FROM analytics.market_contract mc
+                JOIN analytics.market_event me
+                  ON me.event_id = mc.event_id
+                WHERE LOWER(COALESCE(mc.market_slug, '')) = ANY(:market_slugs)
+                  AND (
+                    mc.is_closed = TRUE
+                    OR me.closed_time IS NOT NULL
+                    OR (mc.end_time IS NOT NULL AND mc.end_time <= NOW())
+                  )
+                ORDER BY COALESCE(me.closed_time, mc.end_time, mc.updated_at) DESC NULLS LAST,
+                         mc.market_contract_id DESC
+                LIMIT 5
+                """
+            ),
+            {"market_slugs": normalized_market_slugs},
+        ).mappings().all()
+        resolved_outcomes = load_resolved_market_outcomes(session) if closed_market_rows else {}
+        recent_closed_markets = [
+            {
+                "market_slug": row["market_slug"],
+                "question": row["question"],
+                "closed_time": row["closed_time"].isoformat() if row["closed_time"] else None,
+                "result_label": _resolved_result_label(
+                    resolved_outcomes,
+                    condition_ref=row["condition_ref"],
+                    outcome_a_label=row["outcome_a_label"],
+                    outcome_b_label=row["outcome_b_label"],
+                ),
+                "market_status_label": "Closed",
+            }
+            for row in closed_market_rows
+        ]
+
+    return {
+        "summary": watchlist_summary,
+        "inflow_24h": inflow_24h,
+        "market_focus_recent": market_focus_recent,
+        "recent_closed_markets": recent_closed_markets,
+        "trader_focus": trader_focus,
+    }
+
+
+def following_user_cards(
+    session: Session,
+    *,
+    user_ids: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Return compact followed-trader cards in the original watchlist order."""
+    normalized_user_ids = _normalize_watchlist_user_ids(user_ids)
+    if not normalized_user_ids:
+        return []
+
+    accounts = {
+        row.user_id: row
+        for row in session.scalars(
+            select(UserAccount).where(UserAccount.user_id.in_(normalized_user_ids))
+        ).all()
+    }
+
+    latest_batch = _latest_whale_batch(session)
+    score_by_user: dict[int, WhaleScoreSnapshot] = {}
+    if latest_batch is not None:
+        score_by_user = {
+            row.user_id: row
+            for row in session.scalars(
+                select(WhaleScoreSnapshot).where(
+                    WhaleScoreSnapshot.user_id.in_(normalized_user_ids),
+                    WhaleScoreSnapshot.snapshot_time == latest_batch.snapshot_time,
+                    WhaleScoreSnapshot.scoring_version == latest_batch.scoring_version,
+                )
+            ).all()
+        }
+
+    return [
+        {
+            "user_id": account.user_id,
+            "external_user_ref": account.external_user_ref,
+            "wallet_address": account.wallet_address,
+            "preferred_username": account.preferred_username,
+            "display_label": account.display_label,
+            "is_likely_insider": bool(account.is_likely_insider),
+            "whale_status": (
+                _score_whale_status(score.is_whale, score.is_trusted_whale)
+                if (score := score_by_user.get(user_id)) is not None
+                else False
+            ),
+            "latest_whale_score": (
+                {
+                    "snapshot_time": score.snapshot_time.isoformat() if score.snapshot_time else None,
+                    "scoring_version": score.scoring_version,
+                    "trust_score": float(score.trust_score or 0),
+                    "profitability_score": float(score.profitability_score or 0),
+                    "sample_trade_count": int(score.sample_trade_count or 0),
+                    "is_whale": bool(score.is_whale),
+                    "is_trusted_whale": bool(score.is_trusted_whale),
+                    "whale_status": _score_whale_status(score.is_whale, score.is_trusted_whale),
+                }
+                if (score := score_by_user.get(user_id)) is not None
+                else None
+            ),
+        }
+        for user_id in normalized_user_ids
+        if (account := accounts.get(user_id)) is not None
+    ]
+
+
+def following_market_cards(
+    session: Session,
+    *,
+    market_slugs: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return compact followed-market cards in the original watchlist order."""
+    normalized_market_slugs = _normalize_watchlist_market_slugs(market_slugs)
+    if not normalized_market_slugs:
+        return []
+
+    cards_by_slug: dict[str, dict[str, Any]] = {}
+
+    latest_dashboard_rows = session.execute(
+        text(
+            """
+            WITH latest_dashboard AS (
+              SELECT dashboard_id
+              FROM analytics.dashboard
+              ORDER BY generated_at DESC, dashboard_id DESC
+              LIMIT 1
+            ),
+            ranked_rows AS (
+              SELECT
+                LOWER(COALESCE(dm.market_slug, '')) AS normalized_slug,
+                dm.market_slug,
+                mc.question,
+                dm.price,
+                dm.whale_count,
+                dm.trusted_whale_count,
+                (
+                  mc.is_closed = TRUE
+                  OR me.closed_time IS NOT NULL
+                  OR (mc.end_time IS NOT NULL AND mc.end_time <= NOW())
+                ) AS is_closed,
+                ROW_NUMBER() OVER (
+                  PARTITION BY LOWER(COALESCE(dm.market_slug, ''))
+                  ORDER BY dm.read_time DESC NULLS LAST, dm.market_id DESC
+                ) AS row_num
+              FROM analytics.dashboard_market dm
+              JOIN analytics.market_contract mc
+                ON mc.market_contract_id = dm.market_contract_id
+              JOIN analytics.market_event me
+                ON me.event_id = mc.event_id
+              WHERE dm.dashboard_id = (SELECT dashboard_id FROM latest_dashboard)
+                AND LOWER(COALESCE(dm.market_slug, '')) = ANY(:market_slugs)
+            )
+            SELECT
+              normalized_slug,
+              market_slug,
+              question,
+              price,
+              whale_count,
+              trusted_whale_count,
+              is_closed
+            FROM ranked_rows
+            WHERE row_num = 1
+            """
+        ),
+        {"market_slugs": normalized_market_slugs},
+    ).mappings().all()
+
+    for row in latest_dashboard_rows:
+        normalized_slug = row["normalized_slug"]
+        database_is_closed = bool(row["is_closed"])
+        cards_by_slug[normalized_slug] = {
+            "market_slug": row["market_slug"] or normalized_slug,
+            "question": row["question"] or row["market_slug"] or normalized_slug,
+            "price": float(row["price"]) if row["price"] is not None else None,
+            "whale_count": int(row["whale_count"] or 0),
+            "trusted_whale_count": int(row["trusted_whale_count"] or 0),
+            "market_status_label": _market_status_label(database_is_closed),
+            "database_is_closed": database_is_closed,
+            "closed_status_source": "database" if database_is_closed else None,
+        }
+
+    remaining_market_slugs = [slug for slug in normalized_market_slugs if slug not in cards_by_slug]
+    if remaining_market_slugs:
+        historical_rows = session.execute(
+            text(
+                """
+                WITH ranked_rows AS (
+                  SELECT
+                    LOWER(COALESCE(dm.market_slug, '')) AS normalized_slug,
+                    dm.market_slug,
+                    mc.question,
+                    dm.price,
+                    dm.whale_count,
+                    dm.trusted_whale_count,
+                    (
+                      mc.is_closed = TRUE
+                      OR me.closed_time IS NOT NULL
+                      OR (mc.end_time IS NOT NULL AND mc.end_time <= NOW())
+                    ) AS is_closed,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY LOWER(COALESCE(dm.market_slug, ''))
+                      ORDER BY d.generated_at DESC,
+                               dm.read_time DESC NULLS LAST,
+                               dm.market_id DESC
+                    ) AS row_num
+                  FROM analytics.dashboard_market dm
+                  JOIN analytics.dashboard d
+                    ON d.dashboard_id = dm.dashboard_id
+                  JOIN analytics.market_contract mc
+                    ON mc.market_contract_id = dm.market_contract_id
+                  JOIN analytics.market_event me
+                    ON me.event_id = mc.event_id
+                  WHERE LOWER(COALESCE(dm.market_slug, '')) = ANY(:market_slugs)
+                )
+                SELECT
+                  normalized_slug,
+                  market_slug,
+                  question,
+                  price,
+                  whale_count,
+                  trusted_whale_count,
+                  is_closed
+                FROM ranked_rows
+                WHERE row_num = 1
+                """
+            ),
+            {"market_slugs": remaining_market_slugs},
+        ).mappings().all()
+
+        for row in historical_rows:
+            normalized_slug = row["normalized_slug"]
+            database_is_closed = bool(row["is_closed"])
+            cards_by_slug[normalized_slug] = {
+                "market_slug": row["market_slug"] or normalized_slug,
+                "question": row["question"] or row["market_slug"] or normalized_slug,
+                "price": float(row["price"]) if row["price"] is not None else None,
+                "whale_count": int(row["whale_count"] or 0),
+                "trusted_whale_count": int(row["trusted_whale_count"] or 0),
+                "market_status_label": _market_status_label(database_is_closed),
+                "database_is_closed": database_is_closed,
+                "closed_status_source": "database" if database_is_closed else None,
+            }
+
+    remaining_market_slugs = [slug for slug in normalized_market_slugs if slug not in cards_by_slug]
+    if remaining_market_slugs:
+        contract_rows = session.execute(
+            text(
+                """
+                WITH ranked_contracts AS (
+                  SELECT
+                    LOWER(COALESCE(mc.market_slug, '')) AS normalized_slug,
+                    mc.market_slug,
+                    mc.question,
+                    mc.last_trade_price AS price,
+                    (
+                      mc.is_closed = TRUE
+                      OR me.closed_time IS NOT NULL
+                      OR (mc.end_time IS NOT NULL AND mc.end_time <= NOW())
+                    ) AS is_closed,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY LOWER(COALESCE(mc.market_slug, ''))
+                      ORDER BY mc.updated_at DESC NULLS LAST, mc.market_contract_id DESC
+                    ) AS row_num
+                  FROM analytics.market_contract mc
+                  JOIN analytics.market_event me
+                    ON me.event_id = mc.event_id
+                  WHERE LOWER(COALESCE(mc.market_slug, '')) = ANY(:market_slugs)
+                )
+                SELECT
+                  normalized_slug,
+                  market_slug,
+                  question,
+                  price,
+                  is_closed
+                FROM ranked_contracts
+                WHERE row_num = 1
+                """
+            ),
+            {"market_slugs": remaining_market_slugs},
+        ).mappings().all()
+
+        for row in contract_rows:
+            normalized_slug = row["normalized_slug"]
+            database_is_closed = bool(row["is_closed"])
+            cards_by_slug[normalized_slug] = {
+                "market_slug": row["market_slug"] or normalized_slug,
+                "question": row["question"] or row["market_slug"] or normalized_slug,
+                "price": float(row["price"]) if row["price"] is not None else None,
+                "whale_count": 0,
+                "trusted_whale_count": 0,
+                "market_status_label": _market_status_label(database_is_closed),
+                "database_is_closed": database_is_closed,
+                "closed_status_source": "database" if database_is_closed else None,
+            }
+
+    return [
+        _apply_live_polymarket_following_card_overlay(cards_by_slug[market_slug])
+        for market_slug in normalized_market_slugs
+        if market_slug in cards_by_slug
+    ]
+
+
+def following_dashboard(
+    session: Session,
+    *,
+    user_ids: list[int] | None = None,
+    market_slugs: list[str] | None = None,
+) -> dict[str, Any]:
+    """Return the full Following page payload in one backend round trip."""
+    normalized_user_ids = _normalize_watchlist_user_ids(user_ids)
+    normalized_market_slugs = _normalize_watchlist_market_slugs(market_slugs)
+    overview = following_overview(
+        session,
+        user_ids=normalized_user_ids,
+        market_slugs=normalized_market_slugs,
+    )
+    markets = following_market_cards(session, market_slugs=normalized_market_slugs)
+    closed_market_slugs = {
+        str(item.get("market_slug") or "").strip().casefold()
+        for item in overview.get("recent_closed_markets", [])
+        if isinstance(item, dict)
+    }
+    recent_closed_markets = [
+        item for item in overview.get("recent_closed_markets", []) if isinstance(item, dict)
+    ]
+    additional_live_closed_count = 0
+    for market in markets:
+        normalized_market_slug = str(market.get("market_slug") or "").strip().casefold()
+        if normalized_market_slug in closed_market_slugs:
+            market["market_status_label"] = "Closed"
+            continue
+        if market.get("market_status_label") != "Closed":
+            continue
+
+        closed_market_slugs.add(normalized_market_slug)
+        if market.get("closed_status_source") == "polymarket_gamma_live" and not market.get("database_is_closed"):
+            additional_live_closed_count += 1
+        recent_closed_markets.append(
+            {
+                "market_slug": market.get("market_slug"),
+                "question": market.get("question"),
+                "closed_time": market.get("closed_time"),
+                "result_label": market.get("result_label") or "Closed",
+                "market_status_label": "Closed",
+            }
+        )
+
+    if additional_live_closed_count:
+        overview_summary = overview.get("summary")
+        if isinstance(overview_summary, dict):
+            overview_summary["recent_closed_followed_market_count"] = int(
+                overview_summary.get("recent_closed_followed_market_count") or 0
+            ) + additional_live_closed_count
+
+    if recent_closed_markets:
+        overview["recent_closed_markets"] = sorted(
+            recent_closed_markets,
+            key=lambda item: str(item.get("closed_time") or ""),
+            reverse=True,
+        )[:5]
+        for market in markets:
+            if str(market.get("market_slug") or "").strip().casefold() in closed_market_slugs:
+                market["market_status_label"] = "Closed"
+    return {
+        "overview": overview,
+        "users": following_user_cards(session, user_ids=normalized_user_ids),
+        "markets": markets,
+    }
+
+
+def latest_market_profile(session: Session, market_slug: str) -> dict[str, Any] | None:
+    """Return the best available market profile details for one market slug."""
+    dashboard = session.scalars(select(Dashboard).order_by(desc(Dashboard.generated_at)).limit(1)).first()
+    if dashboard is not None:
+        latest_row = session.execute(
+            select(DashboardMarket, MarketContract, MarketProfile)
+            .join(MarketContract, MarketContract.market_contract_id == DashboardMarket.market_contract_id)
+            .join(
+                MarketProfile,
+                (MarketProfile.dashboard_id == DashboardMarket.dashboard_id)
+                & (MarketProfile.market_contract_id == DashboardMarket.market_contract_id),
+            )
+            .where(
+                DashboardMarket.dashboard_id == dashboard.dashboard_id,
+                DashboardMarket.market_slug == market_slug,
+            )
+            .order_by(desc(DashboardMarket.read_time), desc(DashboardMarket.market_id))
+            .limit(1)
+        ).first()
+        if latest_row is not None:
+            market, contract, profile = latest_row
+            market_slug_value = market.market_slug or contract.market_slug
+            payload = _serialize_market_profile(
+                dashboard_id=dashboard.dashboard_id,
+                market_id=market.market_id,
+                market=market,
+                contract=contract,
+                profile=profile,
+                observed_volume=_observed_trade_volume_for_market(
+                    session,
+                    contract=contract,
+                    market_slug=market_slug_value,
+                ),
+                orderbook_depth=_latest_orderbook_depth_for_market(
+                    session,
+                    contract=contract,
+                    market_slug=market_slug_value,
+                ),
+            )
+            payload["whale_market_focus"] = _normalize_whale_market_focus(session, payload["whale_market_focus"])
+            live_market = fetch_live_polymarket_market_by_slug(str(payload.get("market_slug") or market_slug_value or ""))
+            payload.update(
+                _apply_profile_freshness(
+                    payload,
+                    fallback_observed_at=profile.snapshot_time if profile and profile.snapshot_time else market.read_time,
+                    fallback_source="analytics.market_profile.snapshot_time",
+                    last_successful_ingest_at=_latest_successful_scrape_time(session),
+                    live_market=live_market,
+                )
+            )
+            return payload
+
+    historical_row = session.execute(
+        select(DashboardMarket, Dashboard, MarketContract, MarketProfile)
+        .join(Dashboard, Dashboard.dashboard_id == DashboardMarket.dashboard_id)
+        .join(MarketContract, MarketContract.market_contract_id == DashboardMarket.market_contract_id)
+        .join(
+            MarketProfile,
+            (MarketProfile.dashboard_id == DashboardMarket.dashboard_id)
+            & (MarketProfile.market_contract_id == DashboardMarket.market_contract_id),
+        )
+        .where(DashboardMarket.market_slug == market_slug)
+        .order_by(
+            desc(Dashboard.generated_at),
+            desc(MarketProfile.snapshot_time),
+            desc(DashboardMarket.read_time),
+            desc(DashboardMarket.market_id),
+        )
+        .limit(1)
+    ).first()
+    if historical_row is not None:
+        market, historical_dashboard, contract, profile = historical_row
+        market_slug_value = market.market_slug or contract.market_slug
+        payload = _serialize_market_profile(
+            dashboard_id=historical_dashboard.dashboard_id,
+            market_id=market.market_id,
+            market=market,
+            contract=contract,
+            profile=profile,
+            observed_volume=_observed_trade_volume_for_market(
+                session,
+                contract=contract,
+                market_slug=market_slug_value,
+            ),
+            orderbook_depth=_latest_orderbook_depth_for_market(
+                session,
+                contract=contract,
+                market_slug=market_slug_value,
+            ),
+        )
+        payload["whale_market_focus"] = _normalize_whale_market_focus(session, payload["whale_market_focus"])
+        live_market = fetch_live_polymarket_market_by_slug(str(payload.get("market_slug") or market_slug_value or ""))
+        payload.update(
+            _apply_profile_freshness(
+                payload,
+                fallback_observed_at=profile.snapshot_time if profile and profile.snapshot_time else market.read_time,
+                fallback_source="analytics.market_profile.snapshot_time",
+                last_successful_ingest_at=_latest_successful_scrape_time(session),
+                live_market=live_market,
+            )
+        )
+        return payload
+
+    contract = session.scalars(
+        select(MarketContract)
+        .where(MarketContract.market_slug == market_slug)
+        .order_by(desc(MarketContract.updated_at), desc(MarketContract.market_contract_id))
+        .limit(1)
+    ).first()
+    if contract is None:
+        return None
+
+    latest_orderbook = session.scalars(
+        select(OrderbookSnapshot)
+        .where(OrderbookSnapshot.market_contract_id == contract.market_contract_id)
+        .order_by(desc(OrderbookSnapshot.snapshot_time), desc(OrderbookSnapshot.orderbook_snapshot_id))
+        .limit(1)
+    ).first()
+    payload = _serialize_market_profile(
+        dashboard_id=0,
+        market_id=0,
+        market=None,
+        contract=contract,
+        profile=None,
+        observed_volume=_observed_trade_volume_for_market(
+            session,
+            contract=contract,
+            market_slug=contract.market_slug,
+        ),
+        orderbook_depth=_latest_orderbook_depth_for_market(
+            session,
+            contract=contract,
+            market_slug=contract.market_slug,
+        ),
+    )
+    payload["whale_market_focus"] = _normalize_whale_market_focus(session, payload["whale_market_focus"])
+    live_market = fetch_live_polymarket_market_by_slug(str(payload.get("market_slug") or contract.market_slug or ""))
+    payload.update(
+        _apply_profile_freshness(
+            payload,
+            fallback_observed_at=latest_orderbook.snapshot_time if latest_orderbook is not None else contract.updated_at,
+            fallback_source=(
+                "analytics.orderbook_snapshot.snapshot_time"
+                if latest_orderbook is not None
+                else "analytics.market_contract.updated_at"
+            ),
+            last_successful_ingest_at=_latest_successful_scrape_time(session),
+            live_market=live_market,
+        )
+    )
+    return payload
+
+
+def latest_whale_scores(
+    session: Session,
+    *,
+    limit: int = DEFAULT_LIMIT,
+    whales_only: bool = False,
+    trusted_only: bool = False,
+    tier: str = "all",
+) -> dict[str, Any] | None:
+    """Return the latest whale-score rows with optional tier filters."""
+    latest_batch = _latest_whale_batch(session)
+    if latest_batch is None:
+        return None
+
+    statement = (
+        select(WhaleScoreSnapshot, UserAccount, Platform)
+        .join(UserAccount, UserAccount.user_id == WhaleScoreSnapshot.user_id)
+        .join(Platform, Platform.platform_id == WhaleScoreSnapshot.platform_id)
+        .where(
+            WhaleScoreSnapshot.snapshot_time == latest_batch.snapshot_time,
+            WhaleScoreSnapshot.scoring_version == latest_batch.scoring_version,
+        )
+        .order_by(
+            desc(WhaleScoreSnapshot.is_trusted_whale),
+            desc(WhaleScoreSnapshot.is_whale),
+            desc(WhaleScoreSnapshot.trust_score),
+            desc(WhaleScoreSnapshot.sample_trade_count),
+        )
+        .limit(limit)
+    )
+    normalized_tier = tier.strip().lower()
+    if normalized_tier == "trusted":
+        statement = statement.where(WhaleScoreSnapshot.is_trusted_whale.is_(True))
+    elif normalized_tier == "whale":
+        statement = statement.where(
+            WhaleScoreSnapshot.is_whale.is_(True),
+            WhaleScoreSnapshot.is_trusted_whale.is_(False),
+        )
+    elif normalized_tier == "potential":
+        statement = statement.where(*_potential_whale_clause())
+    elif normalized_tier == "standard":
+        statement = statement.where(
+            WhaleScoreSnapshot.is_whale.is_(False),
+            WhaleScoreSnapshot.is_trusted_whale.is_(False),
+            ~(
+                (WhaleScoreSnapshot.trust_score >= POTENTIAL_WHALE_MIN_TRUST_SCORE)
+                & (WhaleScoreSnapshot.sample_trade_count >= POTENTIAL_WHALE_MIN_SAMPLE_TRADES)
+            ),
+        )
+    elif trusted_only:
+        statement = statement.where(WhaleScoreSnapshot.is_trusted_whale.is_(True))
+    elif whales_only:
+        statement = statement.where(WhaleScoreSnapshot.is_whale.is_(True))
+
+    rows = session.execute(statement).all()
+    user_ids = [int(account.user_id) for _, account, _ in rows]
+    realized_pnl_by_user: dict[int, float | None] = {}
+    if user_ids:
+        latest_dashboard = session.scalars(select(Dashboard).order_by(desc(Dashboard.generated_at)).limit(1)).first()
+        if latest_dashboard is not None:
+            profile_rows = session.execute(
+                select(UserProfile.user_id, UserProfile.trusted_traders_summary).where(
+                    UserProfile.dashboard_id == latest_dashboard.dashboard_id,
+                    UserProfile.user_id.in_(user_ids),
+                )
+            ).all()
+            for user_id, trusted_traders_summary in profile_rows:
+                if not isinstance(trusted_traders_summary, dict):
+                    continue
+                resolved_performance = trusted_traders_summary.get("resolved_performance")
+                if not isinstance(resolved_performance, dict):
+                    continue
+                realized_pnl = resolved_performance.get("realized_pnl")
+                realized_pnl_by_user[int(user_id)] = float(realized_pnl) if realized_pnl is not None else None
+    items = [
+        {
+            "user_id": account.user_id,
+            "external_user_ref": account.external_user_ref,
+            "wallet_address": account.wallet_address,
+            "preferred_username": account.preferred_username,
+            "display_label": account.display_label,
+            "platform_name": platform.platform_name,
+            "snapshot_time": score.snapshot_time.isoformat() if score.snapshot_time else None,
+            "scoring_version": score.scoring_version,
+            "trust_score": float(score.trust_score or 0),
+            "profitability_score": float(score.profitability_score or 0),
+            "realized_pnl": realized_pnl_by_user.get(int(account.user_id)),
+            "sample_trade_count": int(score.sample_trade_count or 0),
+            "is_whale": bool(score.is_whale),
+            "is_trusted_whale": bool(score.is_trusted_whale),
+            "whale_status": _score_whale_status(score.is_whale, score.is_trusted_whale),
+        }
+        for score, account, platform in rows
+    ]
+    return {
+        "snapshot_time": latest_batch.snapshot_time.isoformat() if latest_batch.snapshot_time else None,
+        "scoring_version": latest_batch.scoring_version,
+        "count": len(items),
+        "items": items,
+    }
+
+
+def latest_user_whale_profile(session: Session, user_id: int) -> dict[str, Any] | None:
+    """Return whale-specific user details for the latest score batch and dashboard snapshot."""
+    user = session.get(UserAccount, user_id)
+    if user is None:
+        return None
+
+    latest_batch = _latest_whale_batch(session)
+    score = None
+    if latest_batch is not None:
+        score = session.scalars(
+            select(WhaleScoreSnapshot).where(
+                WhaleScoreSnapshot.user_id == user_id,
+                WhaleScoreSnapshot.snapshot_time == latest_batch.snapshot_time,
+                WhaleScoreSnapshot.scoring_version == latest_batch.scoring_version,
+            )
+        ).first()
+
+    dashboard = session.scalars(select(Dashboard).order_by(desc(Dashboard.generated_at)).limit(1)).first()
+    profile = None
+    if dashboard is not None:
+        profile = session.scalars(
+            select(UserProfile).where(
+                UserProfile.dashboard_id == dashboard.dashboard_id,
+                UserProfile.user_id == user_id,
+            )
+        ).first()
+
+    return {
+        "user_id": user.user_id,
+        "external_user_ref": user.external_user_ref,
+        "wallet_address": user.wallet_address,
+        "preferred_username": user.preferred_username,
+        "display_label": user.display_label,
+        "is_likely_insider": bool(user.is_likely_insider),
+        "whale_status": (
+            bool(profile.whale_status)
+            if profile is not None
+            else _score_whale_status(score.is_whale, score.is_trusted_whale) if score is not None else False
+        ),
+        "latest_whale_score": (
+            {
+                "snapshot_time": score.snapshot_time.isoformat() if score.snapshot_time else None,
+                "scoring_version": score.scoring_version,
+                "trust_score": float(score.trust_score or 0),
+                "profitability_score": float(score.profitability_score or 0),
+                "sample_trade_count": int(score.sample_trade_count or 0),
+                "is_whale": bool(score.is_whale),
+                "is_trusted_whale": bool(score.is_trusted_whale),
+                "whale_status": _score_whale_status(score.is_whale, score.is_trusted_whale),
+            }
+            if score is not None
+            else None
+        ),
+        "resolved_performance": (
+            (profile.trusted_traders_summary or {}).get("resolved_performance")
+            if profile is not None and isinstance(profile.trusted_traders_summary, dict)
+            else _resolved_summary(session, user_id)
+        ),
+        "dashboard_profile": (
+            {
+                "dashboard_id": profile.dashboard_id,
+                "historical_actions_summary": profile.historical_actions_summary,
+                "insider_stats": profile.insider_stats,
+                "whale_status": bool(profile.whale_status),
+                "trusted_traders_summary": profile.trusted_traders_summary,
+                "total_volume": float(profile.total_volume or 0),
+                "total_shares": float(profile.total_shares or 0),
+                "created_at": profile.created_at.isoformat() if profile.created_at else None,
+            }
+            if profile is not None
+            else None
+        ),
+    }

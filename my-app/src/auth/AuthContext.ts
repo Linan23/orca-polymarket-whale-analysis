@@ -1,0 +1,45 @@
+import { createContext, useContext } from "react";
+import type {
+  AccountPreferences,
+  AccountPreferencesPatch,
+  AuthAccount,
+  LoginPayload,
+  LoginResponse,
+  MfaSetupResponse,
+  SignUpPayload,
+  SignUpResponse,
+  WatchlistState,
+} from "../lib/api";
+
+export type AuthContextValue = {
+  loading: boolean;
+  isAuthenticated: boolean;
+  account: AuthAccount | null;
+  watchlist: WatchlistState;
+  preferences: AccountPreferences;
+  refresh: () => Promise<void>;
+  login: (payload: LoginPayload) => Promise<LoginResponse>;
+  signup: (payload: SignUpPayload) => Promise<SignUpResponse>;
+  verifyEmail: (token: string) => Promise<void>;
+  verifyMfa: (mfaToken: string, code: string) => Promise<void>;
+  requestPasswordReset: (email: string) => Promise<{ ok: boolean; email_sent: boolean; dev_reset_token?: string | null }>;
+  confirmPasswordReset: (token: string, password: string) => Promise<void>;
+  setupMfa: () => Promise<MfaSetupResponse>;
+  enableMfa: (code: string) => Promise<void>;
+  logout: () => Promise<void>;
+  toggleUserFollow: (userId: number) => Promise<void>;
+  toggleMarketFollow: (marketSlug: string) => Promise<void>;
+  removeUserFollow: (userId: number) => Promise<void>;
+  removeMarketFollow: (marketSlug: string) => Promise<void>;
+  updatePreferences: (patch: AccountPreferencesPatch) => Promise<void>;
+};
+
+export const AuthContext = createContext<AuthContextValue | null>(null);
+
+export function useAuth() {
+  const value = useContext(AuthContext);
+  if (!value) {
+    throw new Error("useAuth must be used inside AuthProvider.");
+  }
+  return value;
+}

@@ -1,0 +1,41 @@
+schema_version: 1
+score_name: combined_whale_reliability
+description: >-
+  Point-in-time reliability score combining prior volume, profitability,
+  consistency, and history. It measures historical reliability, not identity,
+  causation, or investment quality.
+
+components:
+  volume:
+    weight: 0.25
+    transform: log1p
+    winsorize_quantiles: [0.01, 0.99]
+  profitability:
+    weight: 0.30
+    metric: prior_realized_return
+    shrink_toward_population: true
+  consistency:
+    weight: 0.25
+    metric: prior_directional_success_rate
+    shrink_toward_population: true
+  history:
+    weight: 0.20
+    metric: prior_resolved_market_count
+    transform: log1p
+
+eligibility:
+  minimum_prior_resolved_markets: 5
+  minimum_prior_transactions: 10
+  insufficient_history_policy: conservative_population_prior
+
+leakage_controls:
+  point_in_time_only: true
+  exclude_current_market_outcome: true
+  exclude_future_transactions: true
+  cutoff_field: feature_cutoff_at
+
+reporting:
+  include_component_scores: true
+  include_history_count: true
+  include_uncertainty: true
+  label_as_predictive_association: true

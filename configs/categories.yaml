@@ -1,0 +1,30 @@
+schema_version: 1
+scope:
+  included_categories:
+    - politics
+    - crypto
+    - finance
+    - technology
+    - geopolitics
+  excluded_categories:
+    - sports
+    - entertainment
+    - weather
+  unknown_category_policy: review
+
+normalization:
+  politics:
+    aliases: [politics, elections, government, policy]
+  crypto:
+    aliases: [crypto, cryptocurrency, bitcoin, ethereum, blockchain]
+  finance:
+    aliases: [finance, markets, equities, rates, macroeconomics]
+  technology:
+    aliases: [technology, tech, artificial-intelligence, software]
+  geopolitics:
+    aliases: [geopolitics, world, international-relations, conflict]
+
+review_rules:
+  require_single_primary_category: true
+  retain_raw_labels: true
+  log_unmapped_labels: true

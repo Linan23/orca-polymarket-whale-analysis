@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Project operating rules
+    url: https://github.com/Linan23/orca-polymarket-whale-analysis/blob/main/AGENTS.md
+    about: Review agent ownership, handoffs, and evidence requirements before opening work.

@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "project": "orca-polymarket-whale-analysis",
+  "description": "Registry of reproducible analytical runs. Entries are added only after artifacts and checksums exist.",
+  "experiments": []
+}

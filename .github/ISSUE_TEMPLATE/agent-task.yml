@@ -1,0 +1,64 @@
+name: Agent task
+description: A bounded implementation or analysis task with explicit ownership and acceptance evidence.
+title: "[Task]: "
+labels:
+  - agent-task
+body:
+  - type: dropdown
+    id: role
+    attributes:
+      label: Owning role
+      options:
+        - Manager / integrator
+        - Data builder
+        - ML builder
+        - Research analyst
+        - Dashboard builder
+        - Tester
+        - Reviewer
+    validations:
+      required: true
+  - type: textarea
+    id: objective
+    attributes:
+      label: Objective
+      description: State one measurable outcome.
+    validations:
+      required: true
+  - type: textarea
+    id: inputs_outputs
+    attributes:
+      label: Inputs and outputs
+      description: List required inputs, expected outputs, and artifact schemas.
+    validations:
+      required: true
+  - type: textarea
+    id: paths
+    attributes:
+      label: Authorized paths
+      description: List the files or directories this task may modify.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance commands and evidence
+      description: Provide exact commands, expected results, dataset hash, experiment ID, or claim ID as applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and merge order
+      description: Identify blocking issues and downstream consumers.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety constraints
+      options:
+        - label: No causal claim will be made from predictive association alone.
+          required: true
+        - label: Raw/private datasets and credentials will remain outside Git.
+          required: true
+        - label: A different agent will perform final testing or review.
+          required: true

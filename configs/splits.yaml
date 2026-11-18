@@ -1,0 +1,26 @@
+schema_version: 1
+strategy: grouped_chronological
+group_key: condition_ref
+time_key: feature_cutoff_at
+
+partitions:
+  train_fraction: 0.60
+  validation_fraction: 0.20
+  test_fraction: 0.20
+
+constraints:
+  market_may_cross_partitions: false
+  final_test_is_locked: true
+  preprocessing_fit_on_training_only: true
+  feature_selection_fit_on_training_only: true
+  reliability_features_use_prior_data_only: true
+
+rolling_evaluation:
+  enabled: true
+  minimum_folds: 5
+  expanding_training_window: true
+  preserve_time_order: true
+
+randomness:
+  primary_seed: 42
+  evaluation_seeds: [11, 23, 42, 67, 101]

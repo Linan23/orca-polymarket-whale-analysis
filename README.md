@@ -1,6 +1,28 @@
-# Orca Polymarket Dashboard
+# Orca Polymarket Whale Analysis
+
+Authors: Anthony, Noah, and Uday
+
+This repository studies whether activity from historically reliable Polymarket whales adds predictive information about market-probability movement 12 and 24 hours later. It combines a reproducible analytics pipeline with a local dashboard demonstration. The project measures predictive association, not causation, and is not financial advice.
+
+The primary research question is:
+
+> Does trust-weighted whale activity improve 12-hour and 24-hour probability-movement forecasts beyond current price and ordinary market activity?
+
+The GitHub repository is the project deliverable. Analysis is implemented as deterministic scripts, machine-readable experiment artifacts, generated reports, tests, and a local React/FastAPI demonstration; no notebook is required for this project.
 
 Orca is a Polymarket-focused analytics dashboard that tracks whale activity, trust-weighted trader behavior, market coverage, and ML-assisted 12h/24h probability forecasts. The project is built for handoff: code, jobs, configuration, and documentation are organized so a new developer can understand the system without relying on informal notes.
+
+## Project Workflow
+
+Work is coordinated through role-specific agents and reviewed through evidence gates:
+
+- [Agent operating rules](AGENTS.md)
+- [Contribution and pull-request workflow](CONTRIBUTING.md)
+- [Project plan and acceptance gates](docs/PROJECT_PLAN.md)
+- [Executable analysis guide](analysis/README.md)
+- [Local demonstration guide](demo/README.md)
+
+Builders do not approve their own analytical claims. Every headline result must be traceable to a dataset fingerprint, experiment configuration, commit, generated artifact, uncertainty estimate, and independent review.
 
 ## Scope
 

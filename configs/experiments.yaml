@@ -1,0 +1,62 @@
+schema_version: 1
+project:
+  title: Does Whale Activity Predict Short-Horizon Price Movement in Prediction Markets?
+  authors: [Anthony, Noah, Uday]
+  deadline: 2026-12-05
+  primary_question: >-
+    Does trust-weighted whale activity add out-of-sample predictive information
+    about Polymarket probability movement beyond current price and ordinary
+    market activity?
+  interpretation_rule: predictive_association_not_causation
+
+tasks:
+  movement_24h:
+    role: primary
+    type: regression
+    target: probability_change_24h
+    primary_metric: rmse
+    secondary_metrics: [mae, directional_accuracy, r2]
+  movement_12h:
+    role: secondary
+    type: regression
+    target: probability_change_12h
+    primary_metric: rmse
+    secondary_metrics: [mae, directional_accuracy, r2]
+  final_outcome:
+    role: auxiliary
+    type: classification
+    target: resolved_binary_outcome
+    primary_metric: brier_score
+    secondary_metrics: [log_loss, roc_auc, calibration_error]
+  influential_traders:
+    role: analytical
+    type: ranking
+    definition: >-
+      Traders whose prior activity repeatedly precedes movement after accounting
+      for current price, liquidity, category, and ordinary market activity.
+    required_outputs: [sample_size, uncertainty, stability]
+
+model_families:
+  - no_change_benchmark
+  - regularized_linear
+  - random_forest
+  - lightgbm
+
+feature_sets:
+  - price_only
+  - market_activity_only
+  - whale_only
+  - price_plus_market_activity
+  - price_plus_whale
+  - price_plus_trust_weighted_whale
+  - full
+
+required_analyses:
+  - learning_curves
+  - residual_analysis
+  - paired_bootstrap_intervals
+  - reliability_component_ablation
+  - category_subgroups
+  - time_shift_stress
+  - cold_start_stress
+  - liquidity_stress

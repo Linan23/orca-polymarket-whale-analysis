@@ -1,0 +1,35 @@
+name: analysis-contract
+
+on:
+  pull_request:
+    paths:
+      - "analysis/**"
+      - "configs/**"
+      - "data_platform/jobs/**"
+      - "data_platform/ml/**"
+      - "experiments/**"
+      - "reports/**"
+      - "scripts/reproduce_analysis.sh"
+      - ".github/workflows/analysis.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  structural-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Validate public analysis contract
+        run: scripts/reproduce_analysis.sh --structural-only

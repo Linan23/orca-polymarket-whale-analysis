@@ -1,0 +1,234 @@
+schema_version: 1
+
+dataset:
+  id: polymarket_whale_movement_v1
+  version: null
+  status: historical_source_profiled_not_frozen
+  description: >-
+    Point-in-time market snapshots for testing whether prior trust-weighted
+    whale activity adds predictive information about probability movement.
+
+source_snapshot:
+  source: polymarket
+  source_kind: public_api_observations
+  collection_method: existing_orca_ingestion_jobs
+  external_location: local_docker_volume_from_prior_orca_deployment
+  committed_to_git: false
+  provenance:
+    status: partially_documented
+    repository_jobs:
+      - data_platform/jobs/polymarket_trades_ingest.py
+      - data_platform/jobs/polymarket_orderbook_snapshot.py
+      - data_platform/jobs/polymarket_market_trader_crawl.py
+      - data_platform/jobs/refresh_resolved_conditions.py
+    required_action: >-
+      Rebuild or verify collection logs and freeze the approved source snapshot
+      before assigning a dataset version.
+  licence:
+    declared: null
+    status: review_required
+    required_action: >-
+      Review and record applicable Polymarket terms and redistribution limits
+      before publishing any derived row-level dataset.
+
+coverage:
+  profiled_at_utc: 2026-11-18
+  profile_status: aggregate_read_only_query
+  transaction_time_utc:
+    start: 2025-10-14T06:14:55Z
+    end: 2026-04-27T20:58:52Z
+  resolved_time_utc:
+    start: 2025-03-31T12:00:00Z
+    end: 2026-06-30T12:00:00Z
+  counts:
+    market_events: 4484
+    market_contracts: 10519
+    transactions: 1190139
+    distinct_transaction_traders: 94307
+    traded_contracts: 10483
+    position_snapshots: 96
+    orderbook_snapshots: 21394
+    user_accounts: 129334
+    whale_score_snapshots: 11923605
+    resolved_conditions: 1840
+    winning_outcome_labels_present: 1840
+    authoritative_resolution_labels_verified: 0
+    closed_market_contracts: 27
+    resolved_conditions_without_closed_contract: 1813
+    closed_contracts_without_resolved_condition: 0
+    prediction_snapshots: 964
+    prediction_validations: 2
+
+resolution_label_quality:
+  status: blocking_review_required
+  resolver_methods:
+    trade_price_extreme_fallback:
+      rows: 1821
+      confidence: 0.60
+      classification: heuristic
+    last_trade_price_threshold:
+      rows: 19
+      confidence: 0.75
+      classification: heuristic
+  closed_contract_discrepancy:
+    closed_market_contracts: 27
+    resolved_condition_rows: 1840
+    resolved_without_closed_contract: 1813
+    interpretation: >-
+      Resolution rows are mostly heuristic candidates for contracts not marked
+      closed in this snapshot; presence of a winning label is not authoritative.
+  policy:
+    primary_final_outcome_labels: authoritative_resolution_source_only
+    heuristic_labels: sensitivity_analysis_only
+    required_action: >-
+      Verify resolutions against an authoritative source, persist provenance,
+      and compare primary results with and without heuristic labels.
+
+category_quality:
+  status: blocking_normalization_required
+  raw_event_counts:
+    uncategorized: 4474
+    World: 3
+    Starmer: 2
+    exchange: 1
+    Finance: 1
+    France: 1
+    India: 1
+    Russia: 1
+  in_scope_categories: [politics, crypto, finance, technology, geopolitics]
+  unknown_policy: review
+  required_action: >-
+    Reconstruct categories from retained source labels, tags, and event text;
+    preserve raw labels and review ambiguous mappings before model training.
+
+privacy:
+  wallet_data_is_public: true
+  real_world_identity_linking: prohibited
+  raw_wallet_rows_committed: false
+  aggregation_policy: >-
+    Commit only aggregate evidence, schemas, manifests, and checksums. Mask or
+    pseudonymize wallet identifiers in demonstrations and generated reports.
+
+artifacts:
+  raw_snapshot:
+    status: external_not_frozen
+    path: null
+    sha256: null
+    tracked_in_git: false
+  analytical_dataset:
+    status: not_built
+    path: data_platform/runtime/ml/market_snapshot_features.csv
+    sha256: null
+    tracked_in_git: false
+    version_assignment_rule: >-
+      Assign an immutable version and SHA-256 only after the data, category,
+      leakage, and provenance gates pass.
+
+reproduction:
+  profile_command: >-
+    python analysis/profile_historical_data.py
+    --output-json data_platform/runtime/analysis/historical-data-profile.json
+    --output-markdown data_platform/runtime/analysis/historical-data-profile.md
+  build_command: python data_platform/jobs/export_market_ml_dataset.py
+
+targets:
+  probability_bounds: [0.0, 1.0]
+  movement_bounds: [-1.0, 1.0]
+  movement_12h:
+    role: secondary
+    type: regression
+    column: probability_change_12h
+    definition: probability_at_cutoff_plus_12h - probability_at_cutoff
+    horizon_hours: 12
+  movement_24h:
+    role: primary
+    type: regression
+    column: probability_change_24h
+    definition: probability_at_cutoff_plus_24h - probability_at_cutoff
+    horizon_hours: 24
+  final_outcome:
+    role: auxiliary
+    type: binary_classification
+    column: resolved_binary_outcome
+    bounds: [0, 1]
+    definition: resolved winning outcome for the modeled contract side
+    label_policy: authoritative_primary_heuristic_sensitivity_only
+
+target_alignment:
+  status: frozen_v1
+  probability_source_hierarchy:
+    - exact_contract_transaction_price
+    - exact_contract_orderbook_midpoint
+  prohibited_sources:
+    - mutable_current_market_last_trade_price
+    - final_resolution_price
+    - opposite_contract_price_without_explicit_conversion
+  feature_price:
+    direction: backward_as_of
+    rule: latest_eligible_observation_at_or_before_feature_cutoff
+    tie_breakers:
+      - source_priority
+      - latest_effective_timestamp
+      - stable_source_record_id
+  future_targets:
+    direction: forward_only
+    rule: earliest_eligible_observation_at_or_after_exact_horizon
+    maximum_tolerance_minutes:
+      movement_12h: 60
+      movement_24h: 60
+    tie_breakers:
+      - earliest_effective_timestamp
+      - source_priority
+      - stable_source_record_id
+  duplicate_policy: one_deterministic_observation_per_contract_cutoff_horizon
+  missing_target_policy:
+    action: exclude_from_that_horizon_only
+    required_accounting:
+      - horizon
+      - category
+      - attempted_source
+      - exclusion_reason
+
+feature_contract:
+  cutoff_column: feature_cutoff_at
+  point_in_time_only: true
+  allowed_families:
+    - price_state
+    - prior_market_activity
+    - prior_whale_activity
+    - prior_trader_reliability
+    - category_and_time_controls
+  excluded_from_features:
+    - future_transactions
+    - future_orderbook_observations
+    - current_market_resolution
+    - post_cutoff_profitability
+    - raw_wallet_identifier
+    - target_horizon_prices
+
+split_contract:
+  config: configs/splits.yaml
+  strategy: grouped_chronological
+  group_key: condition_ref
+  time_key: feature_cutoff_at
+  same_market_across_partitions: false
+  strict_partition_time_order: true
+  final_test_locked: true
+
+release_gates:
+  - provenance_complete
+  - licence_review_recorded
+  - categories_normalized_and_reviewed
+  - analytical_dataset_hashed
+  - missingness_and_coverage_profiled
+  - point_in_time_leakage_checks_pass
+  - grouped_chronological_split_checks_pass
+  - resolution_label_quality_reviewed
+  - target_alignment_rule_frozen
+
+known_limitations:
+  - Historical source snapshot is external and not yet reproducibly frozen.
+  - Raw event categories are almost entirely missing and require reconstruction.
+  - Orderbook and position snapshot coverage is sparse relative to transactions.
+  - Stored prediction validation history is insufficient for headline claims.
+  - Existing resolution labels are heuristic and not authoritative outcomes.

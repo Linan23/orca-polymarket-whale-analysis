@@ -5,11 +5,21 @@
 ## Common Checks
 
 ```bash
+.venv/bin/python data_platform/tests/analytical_data_contract_check.py
 .venv/bin/python data_platform/tests/smoke_validate.py
 .venv/bin/python data_platform/tests/data_quality_check.py
 .venv/bin/python data_platform/tests/week45_readiness_check.py
 .venv/bin/python data_platform/tests/history_partition_check.py
 ```
+
+`analytical_data_contract_check.py` is database-independent. It validates the
+versioned data manifest, five-category research scope, bounded 12-hour/24-hour
+targets, grouped chronological splits, locked final test period, prior-only
+whale reliability features, privacy exclusions, and reliability-score weights.
+It also inspects `git ls-files` and rejects tracked raw datasets, database dumps,
+runtime outputs, archives, and trained-model artifacts. The narrow exceptions
+are the approved SQL source file, source/configuration JSON paths, and generated
+aggregate CSV/TSV evidence under `reports/tables/`.
 
 ## ML Checks
 

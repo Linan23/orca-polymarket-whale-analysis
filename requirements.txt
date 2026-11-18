@@ -18,6 +18,7 @@ cryptography>=44,<45
 httpx>=0.28,<1
 python-dateutil>=2.9,<3
 python-dotenv>=1.2,<2
+PyYAML>=6,<7
 
 # ML
 scikit-learn>=1.6,<2

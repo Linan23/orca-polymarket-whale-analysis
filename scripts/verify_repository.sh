@@ -65,6 +65,9 @@ echo "[verify] Python compilation"
   build_research_analytics_snapshot.py \
   bootstrap_db.py
 
+echo "[verify] analytical data contract"
+"$orca_python" data_platform/tests/analytical_data_contract_check.py
+
 echo "[verify] Docker Compose configuration"
 docker compose config --quiet
 

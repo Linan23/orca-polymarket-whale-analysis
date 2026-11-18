@@ -124,6 +124,12 @@ artifacts:
     version_assignment_rule: >-
       Assign an immutable version and SHA-256 only after the data, category,
       leakage, and provenance gates pass.
+  category_validation_sample:
+    status: local_dry_run_completed_not_frozen
+    path: data_platform/runtime/category-validation/
+    sha256: null
+    tracked_in_git: false
+    modelling_approved: false
 
 reproduction:
   profile_command: >-
@@ -135,6 +141,9 @@ reproduction:
     python analysis/profile_category_reconstruction.py
     --output-json data_platform/runtime/analysis/category-reconstruction-profile.json
     --output-markdown data_platform/runtime/analysis/category-reconstruction-profile.md
+  category_sample_command: >-
+    python analysis/build_category_validation_sample.py
+    --output-dir data_platform/runtime/category-validation/first-wave
 
 targets:
   probability_bounds: [0.0, 1.0]

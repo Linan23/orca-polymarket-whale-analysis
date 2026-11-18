@@ -39,3 +39,16 @@ After updating the deterministic research-category rules, measure their aggregat
 ```
 
 This command reads raw category evidence, tags, titles, and descriptions inside a repeatable-read, read-only transaction, but emits only aggregate category, status, classified score-margin, and evidence-source counts. The score margin is a rule diagnostic, not a calibrated probability, and is reported only for classified events. The profiler never writes event identifiers or source text. `review` and `unmapped` results remain excluded from category-level modelling until independently reviewed.
+
+## Local Category Validation Sample
+
+Generate the two blinded reviewer files defined by `docs/data/category-validation-guide.md` only in the ignored local runtime directory:
+
+```bash
+export CATEGORY_VALIDATION_SALT="replace-with-a-local-secret-of-at-least-24-bytes"
+.venv/bin/python analysis/build_category_validation_sample.py \
+  --database-url "$DATABASE_URL" \
+  --output-dir data_platform/runtime/category-validation/first-wave
+```
+
+The sampler uses a repeatable-read, read-only transaction and deterministic stratified selection. Reviewer files contain a run-scoped pseudonym and the public text needed for labelling, but no raw event, contract, slug, or wallet identifiers and no classifier output. The separate local prediction reference remains hidden from reviewers. All files are owner-only and must never be committed, attached to GitHub, or exposed by the dashboard. Sample generation does not approve category-level modelling.

@@ -1,0 +1,51 @@
+schema_version: 1
+sample:
+  seed: 20261118
+  classified_per_category: 50
+  review_total: 200
+  unmapped: 100
+  excluded_total: 100
+  physical_sports_excluded: 50
+  use_census_when_below_quota: true
+
+privacy:
+  salt_environment_variable: CATEGORY_VALIDATION_SALT
+  minimum_salt_bytes: 24
+  pseudonym_hex_length: 20
+  allowed_output_root: data_platform/runtime/category-validation
+  include_event_identifiers: false
+  include_contract_identifiers: false
+  include_slugs: false
+  include_wallet_identifiers: false
+
+review_export:
+  max_title_characters: 500
+  max_description_characters: 2000
+  max_tags: 20
+  max_tag_characters: 100
+  reviewers: [reviewer_a, reviewer_b]
+  allowed_labels: [politics, crypto, finance, technology, geopolitics, out_of_scope, insufficient_evidence]
+  allowed_reviewer_confidence: [high, medium, low]
+  allowed_uncertainty_reasons: [none, multiple_categories, incomplete_evidence, other]
+
+gate:
+  modelling_approved: false
+  minimum_completed_reviews_per_reviewer: all_sampled_events
+  minimum_inter_reviewer_agreement: 0.90
+  minimum_cohens_kappa: 0.80
+  minimum_reference_positive_support: 50
+  minimum_classifier_positive_support: 50
+  minimum_per_category_precision: 0.85
+  minimum_per_category_precision_95ci_lower: 0.70
+  minimum_per_category_recall: 0.75
+  minimum_per_category_recall_95ci_lower: 0.60
+  minimum_out_of_scope_precision: 0.90
+  minimum_out_of_scope_recall: 0.90
+  minimum_macro_f1: 0.80
+  maximum_false_in_scope_rate: 0.05
+  bootstrap_replicates: 2000
+  adjudication_agreement_audit_fraction: 0.10
+  maximum_audited_agreement_change_rate: 0.05
+  note: >-
+    These prospective thresholds implement docs/data/category-validation-guide.md.
+    Generating or completing a sample does not approve category-level modelling.

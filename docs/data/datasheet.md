@@ -50,6 +50,8 @@ Raw category metadata is not ready for analysis. Of 4,484 events, 4,474 are unca
 
 A deterministic profiler now measures reconstruction coverage from retained tags, event text, and source labels without emitting event text, identifiers, tags, slugs, or wallet data. Its runtime output is descriptive evidence only and is not a reviewed label set or model-performance result. A privacy-preserving validation review must assess ambiguity, unassigned coverage, and category balance before category-level modelling.
 
+The frozen review definitions, blinded two-reviewer procedure, stratified sampling requirements, metrics, and approval thresholds are specified in the [category validation guide](category-validation-guide.md).
+
 Category-specific results are prohibited until ambiguous records are reviewed or excluded and the independent category-quality gate passes.
 
 ## Frozen price-alignment rule

@@ -7,6 +7,7 @@
 ```bash
 .venv/bin/python data_platform/tests/analytical_data_contract_check.py
 .venv/bin/python data_platform/tests/research_category_normalization_check.py
+.venv/bin/python data_platform/tests/category_validation_sample_check.py
 .venv/bin/python data_platform/tests/smoke_validate.py
 .venv/bin/python data_platform/tests/data_quality_check.py
 .venv/bin/python data_platform/tests/week45_readiness_check.py
@@ -28,6 +29,13 @@ classification, politics/geopolitics separation, crypto/finance conflicts,
 technology classification, physical-sports exclusion, weak and unmapped review
 behavior, configuration validation, retained row-level audit evidence, and the
 absence of raw evidence from aggregate profiler output.
+
+`category_validation_sample_check.py` is database-independent. It exercises
+the real in-memory sampler with synthetic events and verifies deterministic
+stratification, minority and exclusion quotas, run-scoped pseudonyms, two
+separately ordered blinded reviewer templates, aggregate reconciliation,
+spreadsheet-formula neutralization, local-runtime path confinement, and
+fail-closed handling of missing salts or unsafe privacy configuration.
 
 ## ML Checks
 

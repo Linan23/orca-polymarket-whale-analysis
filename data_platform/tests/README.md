@@ -6,6 +6,7 @@
 
 ```bash
 .venv/bin/python data_platform/tests/analytical_data_contract_check.py
+.venv/bin/python data_platform/tests/research_category_normalization_check.py
 .venv/bin/python data_platform/tests/smoke_validate.py
 .venv/bin/python data_platform/tests/data_quality_check.py
 .venv/bin/python data_platform/tests/week45_readiness_check.py
@@ -20,6 +21,13 @@ It also inspects `git ls-files` and rejects tracked raw datasets, database dumps
 runtime outputs, archives, and trained-model artifacts. The narrow exceptions
 are the approved SQL source file, source/configuration JSON paths, and generated
 aggregate CSV/TSV evidence under `reports/tables/`.
+
+`research_category_normalization_check.py` is database-independent. It uses
+synthetic fixtures to validate the exact five-category scope, deterministic
+classification, politics/geopolitics separation, crypto/finance conflicts,
+technology classification, physical-sports exclusion, weak and unmapped review
+behavior, configuration validation, retained row-level audit evidence, and the
+absence of raw evidence from aggregate profiler output.
 
 ## ML Checks
 

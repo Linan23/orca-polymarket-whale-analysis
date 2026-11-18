@@ -1,30 +1,67 @@
-schema_version: 1
+schema_version: 2
 scope:
-  included_categories:
-    - politics
-    - crypto
-    - finance
-    - technology
-    - geopolitics
-  excluded_categories:
-    - sports
-    - entertainment
-    - weather
+  included_categories: [politics, crypto, finance, technology, geopolitics]
+  excluded_categories: [physical_sports, entertainment, weather]
   unknown_category_policy: review
 
 normalization:
   politics:
-    aliases: [politics, elections, government, policy]
+    aliases: [politics, political, elections, government, policy, us politics]
+    strong_keywords: [election, elections, electoral, presidential election, primary election, government shutdown, congress, congressional, senate, senator, house of representatives, parliament, parliamentary, prime minister, cabinet, governor, supreme court, legislation, referendum, approval rating, political party]
+    weak_keywords: [president, presidential, minister, democrat, republican, labour party, conservative party, trump, biden, starmer, macron]
   crypto:
-    aliases: [crypto, cryptocurrency, bitcoin, ethereum, blockchain]
+    aliases: [crypto, cryptocurrency, cryptocurrencies, blockchain]
+    strong_keywords: [bitcoin, ethereum, solana, cryptocurrency, crypto market, blockchain, stablecoin, defi, coinbase, crypto token, crypto etf]
+    weak_keywords: [btc, eth, sol, xrp, dogecoin, token, airdrop, microstrategy, mstr]
   finance:
-    aliases: [finance, markets, equities, rates, macroeconomics]
+    aliases: [finance, financial, markets, equities, macroeconomics]
+    strong_keywords: [stock market, federal reserve, interest rate, rate cut, rate hike, inflation, consumer price index, gross domestic product, recession, unemployment, treasury yield, corporate earnings, initial public offering, merger, acquisition, commodities, equity market]
+    weak_keywords: [stocks, stock, equities, equity, earnings, revenue, fed, cpi, ppi, gdp, jobs report, ipo, etf, bank, bonds, nasdaq, dow jones, s&p 500]
   technology:
-    aliases: [technology, tech, artificial-intelligence, software]
+    aliases: [technology, tech, artificial intelligence, software]
+    strong_keywords: [artificial intelligence, machine learning, large language model, semiconductor, software release, technology company, openai, anthropic, chatgpt]
+    weak_keywords: [ai, llm, nvidia, amd, microsoft, google, alphabet, meta, apple, chip, chips, software, hardware]
   geopolitics:
-    aliases: [geopolitics, world, international-relations, conflict]
+    aliases: [geopolitics, geopolitical, world politics, international relations, foreign policy, world affairs]
+    strong_keywords: [foreign policy, international relations, diplomatic relations, diplomacy, ceasefire, peace agreement, peace talks, military conflict, armed conflict, invasion, sanctions, nato, united nations, territorial dispute, trade war, nuclear agreement, security guarantee, border conflict, regime change, war in ukraine, israel gaza, china taiwan]
+    weak_keywords: [ukraine, russia, putin, zelensky, china, taiwan, iran, israel, gaza, syria, north korea, european union, eu, war, military, global affairs]
+
+exclusions:
+  physical_sports:
+    aliases: [sports, sport, football, basketball, baseball, hockey, soccer]
+    strong_keywords: [nba, nfl, mlb, nhl, premier league, champions league, super bowl, world cup, basketball game, football game, baseball game, hockey game, soccer match, tennis match, golf tournament, formula 1, nascar, ufc fight, boxing match]
+    weak_keywords: [football, basketball, baseball, hockey, soccer, tennis, golf, cricket]
+  entertainment:
+    aliases: [entertainment, movies, television, music]
+    strong_keywords: [box office, academy awards, oscars, grammy awards, billboard chart, television series, movie release]
+    weak_keywords: [celebrity, film, movie, album, streaming series]
+  weather:
+    aliases: [weather, climate weather]
+    strong_keywords: [weather forecast, hurricane landfall, tropical storm, daily temperature, rainfall total, snowfall total]
+    weak_keywords: [hurricane, tornado, rainfall, snowfall, temperature]
+
+scoring:
+  weights:
+    exact_raw_category: 5
+    exact_tag: 4
+    strong_raw_category: 8
+    strong_tag: 5
+    strong_title: 8
+    strong_description: 3
+    weak_raw_category: 4
+    weak_tag: 3
+    weak_title: 2
+    weak_description: 1
+  classification_minimum_score: 5
+  classification_minimum_margin: 2
+  exclusion_minimum_score: 5
+  require_exact_or_strong_evidence: true
+  deterministic_order: [geopolitics, politics, crypto, finance, technology]
 
 review_rules:
   require_single_primary_category: true
   retain_raw_labels: true
+  retain_matched_evidence: true
+  review_in_scope_ties: true
+  review_in_scope_exclusion_conflicts: true
   log_unmapped_labels: true

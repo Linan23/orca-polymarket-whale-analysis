@@ -7,9 +7,12 @@ on:
       - "configs/**"
       - "data_platform/jobs/**"
       - "data_platform/ml/**"
+      - "data_platform/services/research_categories.py"
+      - "data_platform/tests/**"
       - "experiments/**"
       - "reports/**"
       - "scripts/reproduce_analysis.sh"
+      - "scripts/verify_repository.sh"
       - ".github/workflows/analysis.yml"
   workflow_dispatch:
 

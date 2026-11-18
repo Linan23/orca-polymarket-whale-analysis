@@ -46,9 +46,11 @@ Primary final-outcome evaluation must use resolutions verified against an author
 
 ## Category quality
 
-Category metadata is not ready for analysis. Of 4,484 events, 4,474 are uncategorized. The remaining raw labels are sparse and inconsistent: `World` (3), `Starmer` (2), and one each for `exchange`, `Finance`, `France`, `India`, and `Russia`.
+Raw category metadata is not ready for analysis. Of 4,484 events, 4,474 are uncategorized. The remaining raw labels are sparse and inconsistent: `World` (3), `Starmer` (2), and one each for `exchange`, `Finance`, `France`, `India`, and `Russia`.
 
-Before model training, categories must be reconstructed from retained tags, event text, and source labels into politics, crypto, finance, technology, and geopolitics. Raw labels must be preserved, unmapped records logged, and ambiguous mappings reviewed. Category-specific results are prohibited until this gate passes.
+A deterministic profiler now measures reconstruction coverage from retained tags, event text, and source labels without emitting event text, identifiers, tags, slugs, or wallet data. Its runtime output is descriptive evidence only and is not a reviewed label set or model-performance result. A privacy-preserving validation review must assess ambiguity, unassigned coverage, and category balance before category-level modelling.
+
+Category-specific results are prohibited until ambiguous records are reviewed or excluded and the independent category-quality gate passes.
 
 ## Frozen price-alignment rule
 

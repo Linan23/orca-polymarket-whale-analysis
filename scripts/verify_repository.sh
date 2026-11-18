@@ -71,6 +71,9 @@ echo "[verify] analytical data contract"
 echo "[verify] research category normalization"
 "$orca_python" data_platform/tests/research_category_normalization_check.py
 
+echo "[verify] category validation sample"
+"$orca_python" data_platform/tests/category_validation_sample_check.py
+
 echo "[verify] Docker Compose configuration"
 docker compose config --quiet
 

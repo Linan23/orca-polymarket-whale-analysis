@@ -49,6 +49,7 @@ fi
 entrypoints=(
   analysis/profile_historical_data.py
   analysis/profile_category_reconstruction.py
+  analysis/build_category_validation_sample.py
   data_platform/jobs/export_market_ml_dataset.py
   data_platform/jobs/train_market_model.py
   data_platform/jobs/compare_market_model_families.py
@@ -69,6 +70,7 @@ done
 "$orca_python" -m compileall -q data_platform/ml data_platform/jobs
 "$orca_python" data_platform/tests/analytical_data_contract_check.py >/dev/null
 "$orca_python" data_platform/tests/research_category_normalization_check.py >/dev/null
+"$orca_python" data_platform/tests/category_validation_sample_check.py >/dev/null
 
 echo "Structural analysis contract passed."
 echo "Full reproduction is intentionally disabled until a versioned dataset manifest and approved snapshot exist."

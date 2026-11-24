@@ -1,4 +1,4 @@
-"""Validate matured ML market prediction snapshots against actual Polymarket outcomes."""
+"""Validate matured ML market predictions against observed Polymarket trade prices."""
 
 from __future__ import annotations
 
@@ -27,8 +27,8 @@ from data_platform.models.base import utc_now
 
 
 DEFAULT_LIMIT = 1000
-DEFAULT_TARGET_TOLERANCE_MINUTES = 90
-VALIDATION_MODEL_VERSION = "market_profile_prediction_validation_v1"
+DEFAULT_TARGET_TOLERANCE_MINUTES = 60
+VALIDATION_MODEL_VERSION = "market_profile_prediction_validation_v2"
 
 
 @dataclass(frozen=True)
@@ -51,9 +51,9 @@ def _parse_as_of(value: str | None) -> datetime:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
-def _normalize_label(value: Any) -> str:
-    """Normalize outcome labels for source-to-prediction matching."""
-    return "".join(character for character in str(value or "").casefold() if character.isalnum())
+def _effective_tolerance(minutes: int) -> int:
+    """Keep caller-supplied tolerance within the supported forward window."""
+    return min(max(minutes, 0), DEFAULT_TARGET_TOLERANCE_MINUTES)
 
 
 def _safe_float(value: Any) -> float | None:
@@ -72,11 +72,6 @@ def _round(value: float | None, places: int = 6) -> float | None:
     return None if value is None else round(float(value), places)
 
 
-def _clamp(value: float, low: float, high: float) -> float:
-    """Clamp a number to a closed interval."""
-    return max(low, min(value, high))
-
-
 def _direction_from_delta(delta: float | None) -> str | None:
     """Return the dashboard direction bucket for a percentage-point delta."""
     if delta is None:
@@ -86,26 +81,6 @@ def _direction_from_delta(delta: float | None) -> str | None:
     if delta < -0.25:
         return "down"
     return "flat"
-
-
-def _source_price(snapshot_row: dict[str, Any]) -> float | None:
-    """Return the best 0-1 price from an orderbook snapshot row."""
-    mid_price = _safe_float(snapshot_row.get("mid_price"))
-    if mid_price is not None:
-        return mid_price
-    best_bid = _safe_float(snapshot_row.get("best_bid"))
-    best_ask = _safe_float(snapshot_row.get("best_ask"))
-    if best_bid is not None and best_ask is not None:
-        return (best_bid + best_ask) / 2.0
-    return best_bid if best_bid is not None else best_ask
-
-
-def _side_price_pct(source_price: float, *, side_label: Any, outcome_a_label: Any) -> float:
-    """Convert a contract source price into a side-relative percentage."""
-    price_pct = _clamp(source_price * 100.0, 0.0, 100.0)
-    if _normalize_label(side_label) == _normalize_label(outcome_a_label):
-        return price_pct
-    return 100.0 - price_pct
 
 
 def _table_exists(session: Session, schema: str, table_name: str) -> bool:
@@ -124,13 +99,19 @@ def _candidate_rows(
     as_of: datetime,
     limit: int,
     revalidate: bool,
+    tolerance_minutes: int = DEFAULT_TARGET_TOLERANCE_MINUTES,
 ) -> list[dict[str, Any]]:
-    """Return prediction snapshots whose 12h/24h target has matured."""
+    """Return snapshots after their entire forward window has matured."""
+    tolerance_minutes = _effective_tolerance(tolerance_minutes)
+    stale_validation = """
+        v.validation_payload ->> 'validation_model_version' IS DISTINCT FROM :validation_model_version
+        OR v.validation_payload ->> 'target_tolerance_minutes' IS DISTINCT FROM :target_tolerance_minutes
+    """
     validation_filter = ""
     if not revalidate:
-        validation_filter = """
+        validation_filter = f"""
           AND (
-            v.ml_market_prediction_validation_id IS NULL
+            ({stale_validation})
             OR v.validation_status IN ('missing_actual', 'awaiting_actual')
           )
         """
@@ -153,158 +134,57 @@ def _candidate_rows(
           s.prediction_payload,
           mc.outcome_a_label,
           mc.outcome_b_label,
-          mc.condition_ref,
-          mc.is_closed,
-          rc.resolved_condition_id,
-          rc.winning_outcome_label,
-          rc.resolved_at,
-          rc.resolver_method,
-          rc.confidence AS resolution_confidence
+          mc.condition_ref
         FROM analytics.ml_market_prediction_snapshot s
         JOIN analytics.market_contract mc
           ON mc.market_contract_id = s.market_contract_id
+         AND mc.platform_id = s.platform_id
         JOIN analytics.platform p
           ON p.platform_id = s.platform_id
-        LEFT JOIN analytics.resolved_condition rc
-          ON rc.platform_id = mc.platform_id
-         AND rc.condition_ref = mc.condition_ref
         LEFT JOIN analytics.ml_market_prediction_validation v
           ON v.ml_market_prediction_snapshot_id = s.ml_market_prediction_snapshot_id
         WHERE p.platform_name = :platform_name
-          AND s.prediction_target_time IS NOT NULL
-          AND s.prediction_target_time <= :as_of
+          AND s.prediction_window_hours IN (12, 24)
+          AND s.prediction_target_time = s.observation_time
+              + s.prediction_window_hours * INTERVAL '1 hour'
+          AND s.prediction_generated_at < s.prediction_target_time
+          AND s.prediction_target_time <= :matured_through
+          AND s.prediction_generated_at <= :as_of
           AND s.predicted_future_odds_pct IS NOT NULL
           {validation_filter}
-        ORDER BY s.prediction_target_time ASC, s.ml_market_prediction_snapshot_id ASC
+        ORDER BY CASE WHEN ({stale_validation}) THEN 0 ELSE 1 END,
+                 v.validated_at ASC NULLS FIRST,
+                 s.prediction_target_time ASC, s.ml_market_prediction_snapshot_id ASC
         {limit_clause}
         """
     )
     params: dict[str, Any] = {
         "platform_name": platform_name,
         "as_of": as_of,
+        "matured_through": as_of - timedelta(minutes=tolerance_minutes),
+        "validation_model_version": VALIDATION_MODEL_VERSION,
+        "target_tolerance_minutes": str(tolerance_minutes),
     }
     if limit > 0:
         params["limit"] = limit
     return [dict(row) for row in session.execute(query, params).mappings().all()]
 
 
-def _actual_from_resolution(row: dict[str, Any]) -> ActualOutcome | None:
-    """Return final 100/0 actual when the market resolved before the prediction target."""
-    winning_label = row.get("winning_outcome_label")
-    if not winning_label:
-        return None
-    target_time = row.get("prediction_target_time")
-    resolved_at = row.get("resolved_at")
-    if resolved_at is not None and target_time is not None and resolved_at > target_time:
-        return None
-
-    side_won = _normalize_label(row.get("side_label")) == _normalize_label(winning_label)
-    actual_pct = 100.0 if side_won else 0.0
-    delay_seconds = None
-    if resolved_at is not None and target_time is not None:
-        delay_seconds = int((resolved_at - target_time).total_seconds())
-    return ActualOutcome(
-        actual_future_odds_pct=actual_pct,
-        actual_source="resolved_condition",
-        actual_source_detail=f"resolved_condition:{row.get('resolved_condition_id')}",
-        actual_observed_at=resolved_at,
-        target_delay_seconds=delay_seconds,
-        payload={
-            "winning_outcome_label": winning_label,
-            "resolver_method": row.get("resolver_method"),
-            "resolution_confidence": _safe_float(row.get("resolution_confidence")),
-            "resolved_at": resolved_at.isoformat() if isinstance(resolved_at, datetime) else None,
-        },
-    )
-
-
-def _orderbook_tables(session: Session) -> list[str]:
-    """Return available orderbook tables in newest-to-oldest storage order."""
-    tables = []
-    for table_name in ("orderbook_snapshot_part", "orderbook_snapshot"):
-        if _table_exists(session, "analytics", table_name):
-            tables.append(table_name)
-    return tables
-
-
-def _actual_from_orderbook(
-    session: Session,
-    row: dict[str, Any],
-    *,
-    tolerance_minutes: int,
-) -> ActualOutcome | None:
-    """Return the nearest side price around the target time from orderbook snapshots."""
-    target_time = row.get("prediction_target_time")
-    if target_time is None:
-        return None
-    table_names = _orderbook_tables(session)
-    if not table_names:
-        return None
-
-    window_start = target_time - timedelta(minutes=tolerance_minutes)
-    window_end = target_time + timedelta(minutes=tolerance_minutes)
-    union_parts = [
-        f"""
-        SELECT
-          '{table_name}' AS source_table,
-          orderbook_snapshot_id,
-          snapshot_time,
-          mid_price,
-          best_bid,
-          best_ask
-        FROM analytics.{table_name}
-        WHERE market_contract_id = :market_contract_id
-          AND snapshot_time >= :window_start
-          AND snapshot_time <= :window_end
-        """
-        for table_name in table_names
-    ]
-    query = text(
-        f"""
-        SELECT *
-        FROM (
-          {" UNION ALL ".join(union_parts)}
-        ) candidates
-        ORDER BY ABS(EXTRACT(EPOCH FROM (snapshot_time - CAST(:target_time AS TIMESTAMPTZ)))) ASC,
-                 snapshot_time DESC
-        LIMIT 1
-        """
-    )
-    snapshot = session.execute(
-        query,
-        {
-            "market_contract_id": int(row["market_contract_id"]),
-            "window_start": window_start,
-            "window_end": window_end,
-            "target_time": target_time,
-        },
-    ).mappings().first()
-    if not snapshot:
-        return None
-
-    snapshot_row = dict(snapshot)
-    source_price = _source_price(snapshot_row)
-    if source_price is None:
-        return None
-    actual_pct = _side_price_pct(source_price, side_label=row.get("side_label"), outcome_a_label=row.get("outcome_a_label"))
-    observed_at = snapshot_row.get("snapshot_time")
-    delay_seconds = None
-    if isinstance(observed_at, datetime):
-        delay_seconds = int((observed_at - target_time).total_seconds())
-    return ActualOutcome(
-        actual_future_odds_pct=actual_pct,
-        actual_source=str(snapshot_row["source_table"]),
-        actual_source_detail=f"{snapshot_row['source_table']}:{snapshot_row.get('orderbook_snapshot_id')}",
-        actual_observed_at=observed_at,
-        target_delay_seconds=delay_seconds,
-        payload={
-            "source_price": _round(source_price),
-            "mid_price": _round(_safe_float(snapshot_row.get("mid_price"))),
-            "best_bid": _round(_safe_float(snapshot_row.get("best_bid"))),
-            "best_ask": _round(_safe_float(snapshot_row.get("best_ask"))),
-            "target_tolerance_minutes": tolerance_minutes,
-        },
-    )
+ACTUAL_TRADE_SQL = text(
+    """
+    SELECT transaction_id, transaction_time, price
+    FROM analytics.transaction_fact
+    WHERE market_contract_id = :market_contract_id
+      AND platform_id = :platform_id
+      AND transaction_type = 'trade'
+      AND LOWER(BTRIM(outcome_label)) = LOWER(BTRIM(:side_label))
+      AND price BETWEEN 0 AND 1
+      AND transaction_time >= :target_time
+      AND transaction_time <= :window_end
+    ORDER BY transaction_time ASC, transaction_id ASC
+    LIMIT 1
+    """
+)
 
 
 def _actual_outcome(
@@ -313,11 +193,34 @@ def _actual_outcome(
     *,
     tolerance_minutes: int,
 ) -> ActualOutcome | None:
-    """Return the best actual target for a matured prediction."""
-    return _actual_from_resolution(row) or _actual_from_orderbook(
-        session,
-        row,
-        tolerance_minutes=tolerance_minutes,
+    """Select the earliest eligible trade for the exact contract and side."""
+    target_time = row.get("prediction_target_time")
+    side_label = str(row.get("side_label") or "").strip()
+    if target_time is None or not side_label:
+        return None
+
+    tolerance_minutes = _effective_tolerance(tolerance_minutes)
+    trade = session.execute(
+        ACTUAL_TRADE_SQL,
+        {
+            "market_contract_id": int(row["market_contract_id"]),
+            "platform_id": int(row["platform_id"]),
+            "side_label": side_label,
+            "target_time": target_time,
+            "window_end": target_time + timedelta(minutes=tolerance_minutes),
+        },
+    ).mappings().first()
+    if trade is None:
+        return None
+    observed_at = trade["transaction_time"]
+    source_price = float(trade["price"])
+    return ActualOutcome(
+        actual_future_odds_pct=source_price * 100.0,
+        actual_source="transaction_fact",
+        actual_source_detail=f"transaction_fact:{trade['transaction_id']}",
+        actual_observed_at=observed_at,
+        target_delay_seconds=int((observed_at - target_time).total_seconds()),
+        payload={"source_price": _round(source_price), "target_tolerance_minutes": tolerance_minutes},
     )
 
 
@@ -329,6 +232,7 @@ def _validation_row(
 ) -> dict[str, Any]:
     """Return an upsert-ready validation row for one prediction snapshot."""
     now = utc_now()
+    tolerance_minutes = _effective_tolerance(tolerance_minutes)
     actual = _actual_outcome(session, row, tolerance_minutes=tolerance_minutes)
     current_pct = _safe_float(row.get("current_odds_pct"))
     predicted_future_pct = _safe_float(row.get("predicted_future_odds_pct"))
@@ -355,6 +259,7 @@ def _validation_row(
 
     validation_payload = {
         "validation_model_version": VALIDATION_MODEL_VERSION,
+        "target_tolerance_minutes": tolerance_minutes,
         "market_contract_id": row.get("market_contract_id"),
         "condition_ref": row.get("condition_ref"),
         "outcome_a_label": row.get("outcome_a_label"),
@@ -364,7 +269,9 @@ def _validation_row(
         "direction_signal_tier": prediction_payload.get("direction_signal_tier"),
         "display_tier": prediction_payload.get("display_tier"),
         "whale_anchor": prediction_payload.get("whale_anchor") or {},
-        "actual": actual.payload if actual else {"reason": "no resolved outcome or target-time orderbook snapshot"},
+        "actual": actual.payload if actual else {
+            "reason": "no eligible same-outcome trade in the forward target window"
+        },
     }
 
     return {
@@ -494,6 +401,7 @@ def validate_predictions(
     revalidate: bool,
 ) -> dict[str, Any]:
     """Validate matured prediction snapshots and persist actual-vs-predicted errors."""
+    target_tolerance_minutes = _effective_tolerance(target_tolerance_minutes)
     if create_table:
         MlMarketPredictionValidation.__table__.create(bind=session.get_bind(), checkfirst=True)
     if not _table_exists(session, "analytics", "ml_market_prediction_validation"):
@@ -509,6 +417,7 @@ def validate_predictions(
         as_of=as_of,
         limit=limit,
         revalidate=revalidate,
+        tolerance_minutes=target_tolerance_minutes,
     )
     validation_rows = [
         _validation_row(session, row, tolerance_minutes=target_tolerance_minutes)
@@ -542,7 +451,7 @@ def parse_args() -> argparse.Namespace:
         "--target-tolerance-minutes",
         type=int,
         default=int(os.getenv("ML_PREDICTION_VALIDATION_TARGET_TOLERANCE_MINUTES", str(DEFAULT_TARGET_TOLERANCE_MINUTES))),
-        help="Nearest orderbook snapshot tolerance around the 12h/24h target time.",
+        help="Maximum time after the 12h/24h target to match a same-outcome trade, capped at 60 minutes.",
     )
     parser.add_argument("--revalidate", action="store_true", help="Rescore already validated snapshots.")
     parser.add_argument("--create-table", action="store_true", help="Create the validation table when running locally.")

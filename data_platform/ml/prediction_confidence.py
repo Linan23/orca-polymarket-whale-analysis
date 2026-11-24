@@ -68,6 +68,8 @@ VALIDATED_CONFIDENCE_ROWS_SQL = text(
       ON p.platform_id = s.platform_id
     WHERE p.platform_name = :platform_name
       AND v.validation_status = 'validated'
+      AND v.actual_source = 'transaction_fact'
+      AND v.validation_payload ->> 'target_tolerance_minutes' = '60'
       AND v.direction_match IS NOT NULL
       AND v.predicted_direction IN ('up', 'down')
     ORDER BY v.prediction_generated_at ASC, v.ml_market_prediction_validation_id ASC

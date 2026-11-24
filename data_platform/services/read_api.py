@@ -1205,6 +1205,8 @@ def _latest_completed_prediction_validations(
                 ON v.ml_market_prediction_snapshot_id = s.ml_market_prediction_snapshot_id
               WHERE lower(s.market_slug) = :market_slug
                 AND v.validation_status = 'validated'
+                AND v.actual_source = 'transaction_fact'
+                AND v.validation_payload ->> 'target_tolerance_minutes' = '60'
                 AND v.actual_future_odds_pct IS NOT NULL
             )
             SELECT *
@@ -1243,6 +1245,8 @@ def _recent_prediction_validation_summary(
               WHERE lower(v.market_slug) = :market_slug
                 AND v.prediction_window_hours = :window_hours
                 AND v.validation_status = 'validated'
+                AND v.actual_source = 'transaction_fact'
+                AND v.validation_payload ->> 'target_tolerance_minutes' = '60'
                 AND v.actual_future_odds_pct IS NOT NULL
               ORDER BY
                 COALESCE(v.actual_observed_at, v.validated_at) DESC,

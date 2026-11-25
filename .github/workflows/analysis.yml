@@ -36,3 +36,6 @@ jobs:
 
       - name: Validate public analysis contract
         run: scripts/reproduce_analysis.sh --structural-only
+
+      - name: Verify forward target alignment
+        run: python data_platform/tests/target_alignment_check.py

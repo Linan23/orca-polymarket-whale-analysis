@@ -6,6 +6,7 @@ import csv
 import json
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -28,9 +29,10 @@ from data_platform.ml.whale_weighting import (
 )
 
 
-DATASET_VERSION = "ml_market_snapshot_v9"
+DATASET_VERSION = "ml_market_snapshot_v10"
 DEFAULT_HORIZON_HOURS = (720, 168, 72, 24, 6, 1)
 FUTURE_MOVEMENT_WINDOWS_HOURS = (12, 24)
+MOVEMENT_TARGET_TOLERANCE_MINUTES = 60
 RECENT_WHALE_WINDOWS_HOURS = (1, 6, 12, 24)
 DEFAULT_OUTPUT_DIR = Path("data_platform/runtime/ml")
 DEFAULT_DATASET_PATH = DEFAULT_OUTPUT_DIR / "resolved_market_snapshot_features.csv"
@@ -424,14 +426,19 @@ ANALYSIS_COLUMNS = (
     "future_price_up_12h",
     "future_price_observed_12h",
     "future_window_reaches_resolution_12h",
+    "movement_anchor_price_12h",
     "future_price_side_24h",
     "future_price_delta_24h",
     "future_price_up_24h",
     "future_price_observed_24h",
     "future_window_reaches_resolution_24h",
+    "movement_anchor_price_24h",
 )
 
-CSV_COLUMNS = IDENTIFIER_COLUMNS + FEATURE_COLUMNS + ANALYSIS_COLUMNS + AUDIT_COLUMNS
+MOVEMENT_AUDIT_COLUMNS = tuple(
+    f"future_price_missing_reason_{window}h" for window in FUTURE_MOVEMENT_WINDOWS_HOURS
+)
+CSV_COLUMNS = IDENTIFIER_COLUMNS + FEATURE_COLUMNS + ANALYSIS_COLUMNS + AUDIT_COLUMNS + MOVEMENT_AUDIT_COLUMNS
 
 
 CONDITION_METADATA_SQL = text(
@@ -522,13 +529,14 @@ TRANSACTION_SQL = text(
       tf.user_id,
       tf.side,
       tf.outcome_label,
+      tf.transaction_type,
       tf.transaction_time,
       COALESCE(tf.shares, 0) AS shares,
       COALESCE(tf.notional_value, 0) AS notional_value,
-      COALESCE(tf.price, 0) AS price
+      tf.price
     FROM analytics.transaction_fact tf
     JOIN analytics.market_contract mc
-      ON mc.market_contract_id = tf.market_contract_id
+      ON mc.market_contract_id = tf.market_contract_id AND mc.platform_id = tf.platform_id
     JOIN analytics.platform p
       ON p.platform_id = tf.platform_id
     WHERE p.platform_name = 'polymarket'
@@ -1036,35 +1044,60 @@ def _last_trade_age_hours(
 def _future_price_summary(
     *,
     condition_transactions: list[dict[str, Any]],
+    market_contract_id: int,
     side_label: str,
     observation_time: datetime,
     market_end_time: datetime,
-    side_last_price: float,
-    side_label_wins: int,
     window_hours: int,
-) -> dict[str, float]:
-    """Return the side price movement over a future 12h/24h window."""
+) -> dict[str, Any]:
+    """Align an exact-side trade anchor and the first eligible forward trade."""
     target_time = observation_time + timedelta(hours=window_hours)
-    reaches_resolution = int(target_time >= market_end_time)
-    capped_target_time = min(target_time, market_end_time)
+    window_end = target_time + timedelta(minutes=MOVEMENT_TARGET_TOLERANCE_MINUTES)
     normalized_side = _normalized_label(side_label)
-    future_price = float(side_label_wins) if reaches_resolution else float(side_last_price)
-    future_observed = reaches_resolution
+    anchor = None
+    target = None
 
     for trade in condition_transactions:
-        if trade["transaction_time"] <= observation_time or trade["transaction_time"] > capped_target_time:
+        if (
+            trade["market_contract_id"] != market_contract_id
+            or trade["transaction_type"] != "trade"
+            or normalized_side is None
+            or _normalized_label(trade["outcome_label"]) != normalized_side
+            or trade["price"] is None
+        ):
             continue
-        if _normalized_label(str(trade["outcome_label"])) != normalized_side:
+        observed_at = trade["transaction_time"]
+        if observation_time < observed_at < target_time or observed_at > window_end:
             continue
-        future_price = float(trade["price"] or future_price)
-        future_observed = 1
+        price = float(trade["price"])
+        if not 0 <= price <= 1:
+            continue
+        record_id = trade["transaction_id"]
+        if observed_at <= observation_time:
+            key = (observed_at, -record_id)
+            if anchor is None or key > anchor[0]:
+                anchor = (key, price)
+        else:
+            key = (observed_at, record_id)
+            if target is None or key < target[0]:
+                target = (key, price)
 
+    anchor_price = anchor[1] if anchor else None
+    future_price = target[1] if target and anchor else None
+    delta = target[1] - anchor[1] if target and anchor else None
+    reason = ""
+    if anchor is None:
+        reason = "missing_exact_side_anchor"
+    elif target is None:
+        reason = "missing_exact_side_forward_trade"
     return {
-        f"future_price_side_{window_hours}h": round(future_price, 8),
-        f"future_price_delta_{window_hours}h": round(future_price - float(side_last_price), 8),
-        f"future_price_up_{window_hours}h": int(future_price > float(side_last_price)),
-        f"future_price_observed_{window_hours}h": int(future_observed),
-        f"future_window_reaches_resolution_{window_hours}h": reaches_resolution,
+        f"future_price_side_{window_hours}h": round(future_price, 8) if future_price is not None else None,
+        f"future_price_delta_{window_hours}h": round(delta, 8) if delta is not None else None,
+        f"future_price_up_{window_hours}h": int(delta > 0) if delta is not None else None,
+        f"future_price_observed_{window_hours}h": int(delta is not None),
+        f"future_window_reaches_resolution_{window_hours}h": int(target_time >= market_end_time),
+        f"movement_anchor_price_{window_hours}h": round(anchor_price, 8) if anchor_price is not None else None,
+        f"future_price_missing_reason_{window_hours}h": reason,
     }
 
 
@@ -1877,16 +1910,15 @@ def build_market_snapshot_dataset(
                         for user_id in side_state.trusted_whale_user_ids
                     ]
                 )
-                future_targets: dict[str, float] = {}
+                future_targets: dict[str, Any] = {}
                 for window_hours in FUTURE_MOVEMENT_WINDOWS_HOURS:
                     future_targets.update(
                         _future_price_summary(
                             condition_transactions=condition_transactions,
+                            market_contract_id=int(meta["market_contract_id"]),
                             side_label=side_label,
                             observation_time=observation_time,
                             market_end_time=market_end_time,
-                            side_last_price=side_last_price,
-                            side_label_wins=side_label_wins,
                             window_hours=window_hours,
                         )
                     )
@@ -2315,6 +2347,18 @@ def build_market_snapshot_dataset(
         "audit_columns": list(AUDIT_COLUMNS),
         "horizon_hours": list(horizons),
         "future_movement_windows_hours": list(FUTURE_MOVEMENT_WINDOWS_HOURS),
+        "movement_target_coverage": {
+            str(window): {
+                "attempted_source": "exact_contract_and_outcome_trade",
+                "selected_rows": len(dataset_rows),
+                "observed_rows": sum(row[f"future_price_observed_{window}h"] for row in dataset_rows),
+                "missing_reasons": dict(Counter(
+                    row[f"future_price_missing_reason_{window}h"] for row in dataset_rows
+                    if row[f"future_price_missing_reason_{window}h"]
+                )),
+            }
+            for window in FUTURE_MOVEMENT_WINDOWS_HOURS
+        },
         "recent_whale_windows_hours": list(RECENT_WHALE_WINDOWS_HOURS),
         "scored_whale_pressure_columns": list(SCORED_WHALE_PRESSURE_FEATURE_COLUMNS),
         "normalized_trusted_whale_pressure_columns": list(NORMALIZED_TRUSTED_WHALE_PRESSURE_FEATURE_COLUMNS),
@@ -2343,7 +2387,8 @@ def build_market_snapshot_dataset(
             "Trusted whale weighted-pressure features use the versioned whale_weight_config recorded in this metadata file.",
             "Trusted whale weighted-pressure features include raw net pressure and normalized variants scaled by notional, liquidity, and trusted-whale counts.",
             "Recent trusted-whale entry/exit pressure features summarize 1h, 6h, 12h, and 24h pre-cutoff activity with score-weighted and time-decayed pressure.",
-            "Future movement targets report side-price deltas 12h and 24h after each observation cutoff.",
+            "Movement targets use the latest eligible same-contract side trade at or before cutoff and the earliest in the 60-minute forward window.",
+            "Historical orderbook rows require verified token and timestamp provenance before use as movement targets.",
             "Trusted whale entry/exit behavior is reconstructed from matched buy/sell lots instead of treating every sell as a complete exit.",
             "Historical current exposure is approximated from open shares valued at average buy price because full point-in-time position marks are not available for every user.",
             "price_baseline uses the latest side price at the cutoff when available and otherwise falls back to the average side trade price.",
@@ -2389,5 +2434,6 @@ def export_market_snapshot_dataset(
         "row_count": metadata["row_count"],
         "class_balance": metadata["class_balance"],
         "horizon_row_counts": metadata["horizon_row_counts"],
+        "movement_target_coverage": metadata["movement_target_coverage"],
         "excluded_counts": metadata["excluded_counts"],
     }

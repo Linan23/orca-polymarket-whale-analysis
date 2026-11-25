@@ -282,7 +282,11 @@ def _load_training_rows(dataset_path: Path) -> list[dict[str, Any]]:
             else:
                 parsed[RESOLUTION_EDGE_COLUMN] = round(float(parsed[TARGET_COLUMN]) - float(parsed[PRICE_BASELINE_COLUMN]), 8)
             for column in ANALYSIS_COLUMNS:
-                parsed[column] = float(parsed.get(column, row.get(column, 0)) or 0)
+                value = parsed.get(column, row.get(column))
+                if column.startswith(("future_price_side_", "future_price_delta_", "future_price_up_", "movement_anchor_price_")):
+                    parsed[column] = float(value) if value not in (None, "") else None
+                else:
+                    parsed[column] = float(value or 0)
             parsed["market_end_time"] = datetime.fromisoformat(str(row["market_end_time"]))
             parsed["horizon_hours"] = float(row.get("horizon_hours", 0) or 0)
             rows.append(parsed)
@@ -426,21 +430,31 @@ def _require_valid_movement_targets(
     dataset_path: Path,
     rows: list[dict[str, Any]],
     task: str,
-) -> None:
-    """Fail fast when a stale dataset lacks real 12h/24h movement labels."""
+) -> list[dict[str, Any]]:
+    """Keep rows with an observed target for this horizon."""
     target_column, observed_column = _movement_required_columns(task)
-    missing_columns = sorted({target_column, observed_column} - _csv_fieldnames(dataset_path))
+    horizon = "12h" if task == TASK_MARKET_MOVEMENT_12H else "24h"
+    anchor_column = f"movement_anchor_price_{horizon}"
+    missing_columns = sorted({target_column, observed_column, anchor_column} - _csv_fieldnames(dataset_path))
     if missing_columns:
         raise RuntimeError(
             f"{dataset_path} is missing movement target columns {missing_columns}. "
             "Re-run data_platform/jobs/export_market_ml_dataset.py before movement tuning."
         )
-    observed_count = sum(1 for row in rows if float(row.get(observed_column, 0) or 0) >= 0.5)
-    if observed_count == 0:
+    observed = [
+        row for row in rows
+        if row.get(observed_column) == 1
+        and row.get(target_column) is not None
+        and -1 <= row[target_column] <= 1
+        and row.get(anchor_column) is not None
+        and 0 <= row[anchor_column] <= 1
+    ]
+    if not observed:
         raise RuntimeError(
             f"{dataset_path} has no observed rows for {target_column}. "
             "Movement models need future price observations in the selected 12h/24h window."
         )
+    return observed
 
 
 def _filter_rows_by_horizon(
@@ -1400,7 +1414,7 @@ def _assess_market_model_rows(
         raise RuntimeError(f"No rows were found in {dataset_path} after horizon filtering.")
     task = _normalize_task(task)
     if task in {TASK_MARKET_MOVEMENT_12H, TASK_MARKET_MOVEMENT_24H}:
-        _require_valid_movement_targets(dataset_path=dataset_path, rows=rows, task=task)
+        rows = _require_valid_movement_targets(dataset_path=dataset_path, rows=rows, task=task)
     resolved_regime = _normalize_regime(regime)
     feature_selection = _normalize_feature_selection(feature_selection)
 
@@ -3691,10 +3705,10 @@ def analyze_market_movement_residuals(
     windows: dict[str, Any] = {}
     for window_hours in (12, 24):
         task = _movement_task_for_window(window_hours)
-        _require_valid_movement_targets(dataset_path=dataset_path, rows=filtered_rows, task=task)
+        observed_rows = _require_valid_movement_targets(dataset_path=dataset_path, rows=filtered_rows, task=task)
         configs = [
             _residual_config_report(
-                rows=filtered_rows,
+                rows=observed_rows,
                 task=task,
                 estimator_type=estimator_type,
                 estimator_params=resolved_estimator_params,
